@@ -414,6 +414,15 @@ inline int getMaxSharedMemoryPerBlockOptin()
     return nByteMaxSharedMemoryPerBlockOptin;
 }
 
+inline int getL2CacheSize()
+{
+    int nByteL2Cache = 0;
+    int deviceID{0};
+    check_cuda_error(cudaGetDevice(&deviceID));
+    check_cuda_error(cudaDeviceGetAttribute(&nByteL2Cache, cudaDevAttrL2CacheSize, deviceID));
+    return nByteL2Cache;
+}
+
 template <typename T1, typename T2>
 inline size_t divUp(T1 const& a, T2 const& b)
 {
