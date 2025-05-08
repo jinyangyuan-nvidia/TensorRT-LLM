@@ -1860,7 +1860,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, false, false, false, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
