@@ -131,7 +131,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
                     | self.quant_config.quant_mode.
-                    is_int4_weight_only_per_group()):
+                    is_int4_weight_only_per_group()
+                    | self.quant_config.quant_mode.has_w4a16_mxfp4()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -153,6 +154,8 @@ class CutlassFusedMoE(MoE):
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
+                return WInt4AFP8FusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return WInt4AFP8FusedMoEMethod()
             else:
                 raise ValueError(
@@ -264,6 +267,9 @@ class CutlassFusedMoE(MoE):
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
                             swizzedLayout=True)
+            elif self.has_w4a16_mxfp4:
+                use_w4a8_group_scaling = True
+                weight_dtype = torch.uint8
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
