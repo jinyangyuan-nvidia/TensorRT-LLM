@@ -7,6 +7,7 @@ from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
+from ...utils import AuxStreamType, EventType
 from .routing import BaseMoeRoutingMethod
 
 
@@ -45,6 +46,9 @@ class MoE(nn.Module):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
+        support_chunking: bool = False,
     ):
         from ...distributed import AllReduce
 
@@ -87,6 +91,27 @@ class MoE(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=model_config.allreduce_strategy,
                                     dtype=self.dtype)
+
+        max_num_tokens = model_config.max_num_tokens
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.use_dp:
+            max_num_tokens *= self.parallel_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
+        self.moe_enable_overlap = model_config.moe_enable_overlap
+        # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
+        if self.moe_max_num_tokens < max_num_tokens or self.moe_enable_overlap:
+            assert support_chunking, "MoE chunking is not supported"
+            self.aux_stream = aux_stream_dict[
+                AuxStreamType.
+                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
+                )
+            self.event_dict = {
+                key: torch.cuda.Event()
+                for key in [EventType.Main, EventType.MoeChunkingOverlap]
+            }
+        else:
+            self.aux_stream = None
+            self.event_dict = None
 
     @abstractmethod
     def create_weights(self):
@@ -155,23 +180,72 @@ class MoE(nn.Module):
         """
         return False
 
+    def compute_tune_max_num_tokens(self, num_slots: int) -> int:
+        # The profiler converges on the same best tactic when the number of tokens is large enough.
+        # To avoid long profiling time, the max number of tokens used in the profiling is capped to
+        # around 16k tokens per expert, which is well into the compute bound domain.
+        tune_max_num_tokens = min(
+            self.moe_max_num_tokens,
+            16384 * num_slots // self.routing_method.get_experts_per_token(),
+        )
+        return tune_max_num_tokens
+
+    def compute_num_chunks(
+        self,
+        x: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> int:
+        if self.use_dp and self.parallel_size > 1:
+            assert all_rank_num_tokens is not None
+            num_rows = sum(all_rank_num_tokens)
+        else:
+            num_rows = x.shape[0]
+        # If num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
+        num_chunks = (num_rows + self.moe_max_num_tokens -
+                      1) // self.moe_max_num_tokens
+        # If moe_enable_overlap is true and num_rows is splitable, we need to split the input into at least 2 chunks
+        if self.moe_enable_overlap:
+            cond_dp_on = self.use_dp and num_rows > self.parallel_size
+            cond_dp_off = not self.use_dp and num_rows > 1
+            if cond_dp_on or cond_dp_off:
+                num_chunks = max(num_chunks, 2)
+        return num_chunks
+
+    @staticmethod
+    def compute_chunk_size_list(num_tokens: int, num_chunks: int) -> List[int]:
+        val_div = num_tokens // num_chunks
+        val_mod = num_tokens % num_chunks
+        chunk_size_list = [val_div + 1] * val_mod + [val_div
+                                                     ] * (num_chunks - val_mod)
+        return chunk_size_list
+
+    @staticmethod
+    def split_tensor_maybe_with_dummy(
+            x: torch.Tensor, chunk_size_list: List[int]) -> List[torch.Tensor]:
+        x_list = x.split(chunk_size_list)
+        # Avoid potential bugs by replacing empty tensors with dummy tensors
+        x_list = [
+            val if chunk_size > 0 else x[-1:]
+            for val, chunk_size in zip(x_list, chunk_size_list)
+        ]
+        return x_list
+
     def reducescatter_or_allreduce(
         self,
-        inputs,
+        inputs: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
+    ) -> torch.Tensor:
         """
         Common helper for TP and EP in subclasses of the MoE module.
         """
-        outputs = inputs
-        if self.parallel_size > 1 and not self.enable_alltoall:
+        if self.parallel_size > 1:
             if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
+                outputs = reducescatter(inputs,
+                                        self.mapping,
+                                        dim=0,
+                                        sizes=all_rank_num_tokens)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
+        else:
+            outputs = inputs
         return outputs

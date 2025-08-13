@@ -86,6 +86,8 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            aux_stream_dict=aux_stream_dict,
+            support_chunking=True,
         )
 
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
@@ -110,32 +112,8 @@ class CutlassFusedMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
-        # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream_dict[
-                AuxStreamType.
-                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
-                )
-            self.event_dict = {
-                key: torch.cuda.Event()
-                for key in [EventType.Main, EventType.MoeChunkingOverlap]
-            }
-        else:
-            self.aux_stream = None
-            self.event_dict = None
-
-        # The profiler converges on the same best tactic when the number of tokens is large enough.
-        # To avoid long profiling time, the max number of tokens used in the profiling is capped to
-        # around 16k tokens per expert, which is well into the compute bound domain.
-        self.tune_max_num_tokens = min(
-            self.moe_max_num_tokens,
-            16384 * self.num_slots // routing_method.get_experts_per_token(),
-        )
+        self.tune_max_num_tokens = self.compute_tune_max_num_tokens(
+            self.num_slots)
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
@@ -229,16 +207,9 @@ class CutlassFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
+        output_dtype: torch.dtype,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
-        if isinstance(x, Fp4QuantizedTensor):
-            assert output_dtype is not None
-            output_dtype = output_dtype
-        else:
-            output_dtype = x.dtype
-
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
@@ -318,10 +289,8 @@ class CutlassFusedMoE(MoE):
         # Only the non-alltoall case is considered for profiling in the warmup phase.
         # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
         if self.enable_alltoall:
-            if all_rank_num_tokens is not None:
-                tuner_num_tokens = sum(all_rank_num_tokens)
-            else:
-                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
+            tuner_num_tokens = sum(all_rank_num_tokens)
             tuner_top_k = token_selected_experts.shape[1]
         else:
             tuner_num_tokens = None
@@ -331,7 +300,6 @@ class CutlassFusedMoE(MoE):
         token_count = x.shape[0]
         alltoall_info = None  # Store for later combine
         if self.enable_alltoall:
-            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
             top_k = self.routing_method.experts_per_token
             max_num_token = max(
@@ -389,7 +357,7 @@ class CutlassFusedMoE(MoE):
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=all_rank_num_tokens)
             x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
@@ -452,13 +420,6 @@ class CutlassFusedMoE(MoE):
 
         return final_hidden_states
 
-    def split_chunk(self, split_token_num: int, split_num_chunks: int):
-        val_div = split_token_num // split_num_chunks
-        val_mod = split_token_num % split_num_chunks
-        split_chunk_size_list = [val_div + 1] * val_mod + [val_div] * (
-            split_num_chunks - val_mod)
-        return split_chunk_size_list
-
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -466,54 +427,40 @@ class CutlassFusedMoE(MoE):
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
-        use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
-        if self.use_dp and self.parallel_size > 1:
-            assert all_rank_num_tokens is not None
-            assert use_dp_padding is not None
-            num_rows = sum(all_rank_num_tokens)
-        else:
-            num_rows = x.shape[0]
+        if output_dtype is None:
+            assert not isinstance(x, Fp4QuantizedTensor)
+            output_dtype = x.dtype
 
-        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = (num_rows + self.moe_max_num_tokens -
-                      1) // self.moe_max_num_tokens
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
-                                          ] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
-
+        num_chunks = self.compute_num_chunks(x, all_rank_num_tokens)
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                all_rank_num_tokens=all_rank_num_tokens)
             outputs = self.reducescatter_or_allreduce(
-                outputs,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                outputs, all_rank_num_tokens=all_rank_num_tokens)
         else:
             if self.use_dp:
                 all_rank_chunk_size_list = [
-                    self.split_chunk(val, num_chunks)
-                    for val in all_rank_num_tokens_padded
+                    self.compute_chunk_size_list(val, num_chunks)
+                    for val in all_rank_num_tokens
                 ]
-                all_rank_num_tokens_list = [[
-                    val[idx_chunk] for val in all_rank_chunk_size_list
+                all_rank_nonzero_tokens_list = [[
+                    max(val[idx_chunk], 1) for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
                 chunk_size_list = all_rank_chunk_size_list[self.rank]
             else:
-                all_rank_num_tokens_list = [None] * num_chunks
-                chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
+                all_rank_nonzero_tokens_list = [None] * num_chunks
+                chunk_size_list = self.compute_chunk_size_list(
+                    x.shape[0], num_chunks)
 
-            x_list = x.split(chunk_size_list)
-            router_logits_list = router_logits.split(chunk_size_list)
+            x_list = self.split_tensor_maybe_with_dummy(x, chunk_size_list)
+            router_logits_list = self.split_tensor_maybe_with_dummy(
+                router_logits, chunk_size_list)
 
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
@@ -523,15 +470,12 @@ class CutlassFusedMoE(MoE):
                 return self.forward_chunk(
                     x_,
                     router_logits_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
-                    if self.use_dp else None,
-                    use_dp_padding=use_dp_padding)
+                    output_dtype,
+                    all_rank_num_tokens=all_rank_nonzero_tokens_list[idx])
 
             def _reducescatter_or_allreduce(x_, idx):
                 return self.reducescatter_or_allreduce(
-                    x_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
-                    use_dp_padding=use_dp_padding)
+                    x_, all_rank_num_tokens=all_rank_nonzero_tokens_list[idx])
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
@@ -564,10 +508,9 @@ class CutlassFusedMoE(MoE):
             self.event_dict[EventType.MoeChunkingOverlap].wait()
 
             outputs = torch.cat(outputs_list)
-
-        if self.use_dp and self.parallel_size > 1:
-            rank = self.mapping.tp_rank
-            outputs = outputs[:all_rank_num_tokens[rank]]
+            # Dummy tensors may be used and need to be discarded when attention DP is enabled.
+            if self.use_dp and self.parallel_size > 1:
+                outputs = outputs[:all_rank_num_tokens[self.rank]]
         return outputs
 
     def load_weights(self, weights: List[Dict]):

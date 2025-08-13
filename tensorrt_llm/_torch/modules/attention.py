@@ -27,12 +27,19 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-def extract_extra_attrs(layer_idx: str, attn_type: str):
+def extract_extra_attrs(layer_idx: str, attn_type: str, idx_overlap: Optional[int] = None):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs is not set"
 
-    metadata_ref = extra_attrs.get("attention_metadata", None)
+    if idx_overlap is None:
+        metadata_ref = extra_attrs.get("attention_metadata", None)
+    elif idx_overlap == 0:
+        metadata_ref = extra_attrs.get("attention_metadata_overlap_0", None)
+    elif idx_overlap == 1:
+        metadata_ref = extra_attrs.get("attention_metadata_overlap_1", None)
+    else:
+        raise ValueError(f"Invalid index overlap: {idx_overlap}")
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
     if attn_type == "mla":
@@ -507,8 +514,9 @@ def mla_custom_op_inplace(
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
+    idx_overlap: Optional[int] = None,
 ) -> None:
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
+    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla", idx_overlap)
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
 
 
@@ -1454,13 +1462,14 @@ class MLA(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        idx_overlap: Optional[int] = None,
     ) -> torch.Tensor:
 
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
-                                                   attn_output)
+                                                   attn_output, idx_overlap)
         else:
             self.forward_impl(position_ids,
                               hidden_states,

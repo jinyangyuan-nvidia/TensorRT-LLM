@@ -316,8 +316,7 @@ class Llama4MoE(nn.Module):
             router_logits,
             do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+            all_rank_max_num_tokens=all_rank_max_num_tokens)
         return routed_output
 
     def forward(

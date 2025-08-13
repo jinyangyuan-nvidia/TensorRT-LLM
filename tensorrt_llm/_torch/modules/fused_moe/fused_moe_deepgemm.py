@@ -359,16 +359,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
+        output_dtype: torch.dtype,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
-        if isinstance(x, Fp4QuantizedTensor):
-            assert output_dtype is not None
-            output_dtype = output_dtype
-        else:
-            output_dtype = x.dtype
-
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
@@ -403,7 +396,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=all_rank_num_tokens)
 
         (
             permuted_row_to_unpermuted_row_tensor,

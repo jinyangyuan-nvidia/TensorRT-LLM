@@ -35,6 +35,8 @@ class DecodingCUDAGraphRunner:
         spec_metadata: Optional[SpecMetadata] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        attn_metadata_overlap_0: Optional[AttentionMetadata] = None,
+        attn_metadata_overlap_1: Optional[AttentionMetadata] = None,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -74,6 +76,33 @@ class DecodingCUDAGraphRunner:
         self._output = None
         self._graph = None
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
+        if batch_size > 1:
+            offset_split = (batch_size + 1) // 2
+            self.input_ids_overlap_0 = torch.ones(
+                (offset_split * max_beam_width * token_per_request, ),
+                device=device,
+                dtype=torch.int32)
+            self.input_ids_overlap_1 = torch.ones(
+                ((batch_size - offset_split) * max_beam_width * token_per_request, ),
+                device=device,
+                dtype=torch.int32)
+            self.position_ids_overlap_0 = torch.zeros(
+                (1, offset_split * max_beam_width * token_per_request),
+                device=device,
+                dtype=torch.int32)
+            self.position_ids_overlap_1 = torch.zeros(
+                (1, (batch_size - offset_split) * max_beam_width * token_per_request),
+                device=device,
+                dtype=torch.int32)
+            self.attn_metadata_overlap_0 = attn_metadata_overlap_0
+            self.attn_metadata_overlap_1 = attn_metadata_overlap_1
+        else:
+            self.input_ids_overlap_0 = None
+            self.input_ids_overlap_1 = None
+            self.position_ids_overlap_0 = None
+            self.position_ids_overlap_1 = None
+            self.attn_metadata_overlap_0 = None
+            self.attn_metadata_overlap_1 = None
 
     def __del__(self):
         self._graph.reset()
@@ -92,6 +121,15 @@ class DecodingCUDAGraphRunner:
             "spec_metadata": self.spec_metadata,
             "mrope_position_deltas": self.mrope_position_deltas,
         }
+        if self.batch_size > 1:
+            inputs.update({
+                "input_ids_overlap_0": self.input_ids_overlap_0,
+                "input_ids_overlap_1": self.input_ids_overlap_1,
+                "position_ids_overlap_0": self.position_ids_overlap_0,
+                "position_ids_overlap_1": self.position_ids_overlap_1,
+                "attn_metadata_overlap_0": self.attn_metadata_overlap_0,
+                "attn_metadata_overlap_1": self.attn_metadata_overlap_1,
+            })
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:

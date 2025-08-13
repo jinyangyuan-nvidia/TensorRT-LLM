@@ -185,7 +185,6 @@ class TRTLLMGenFusedMoE(MoE):
         router_logits: torch.Tensor,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -390,11 +389,6 @@ class TRTLLMGenFusedMoE(MoE):
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
         )
 
-        if use_dp_padding:
-            rank = self.mapping.tp_rank
-            final_hidden_states = final_hidden_states[:
-                                                      all_rank_num_tokens[rank]]
         return final_hidden_states

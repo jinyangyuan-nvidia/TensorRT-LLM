@@ -1,6 +1,6 @@
 import os
 from enum import IntEnum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -9,7 +9,7 @@ from tensorrt_llm._utils import logger
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed import AllReduce, allgather, reducescatter
+from ...distributed import AllReduce, allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
@@ -82,6 +82,8 @@ class WideEPMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            aux_stream_dict=aux_stream_dict,
+            support_chunking=True,
         )
 
         assert self.use_dp, "Attention DP should be used with WideEP."
@@ -150,31 +152,8 @@ class WideEPMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
-        # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream_dict[
-                AuxStreamType.
-                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
-                )
-            self.event_dict = {
-                key: torch.cuda.Event()
-                for key in [EventType.Main, EventType.MoeChunkingOverlap]
-            }
-        else:
-            self.aux_stream = None
-            self.event_dict = None
-
-        # The profiler converges on the same best tactic when the number of tokens is large enough.
-        # To avoid long profiling time, the max number of tokens used in the profiling is capped to
-        # around 16k tokens per expert, which is well into the compute bound domain.
-        self.tune_max_num_tokens = min(
-            self.moe_max_num_tokens,
-            16384 * self.num_slots // routing_method.get_experts_per_token(),
-        )
+        self.tune_max_num_tokens = self.compute_tune_max_num_tokens(
+            self.num_slots)
         self.has_been_profiled = False
 
         self.alltoall_method_type = self.select_alltoall_method_type(
@@ -292,16 +271,7 @@ class WideEPMoE(MoE):
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
-    def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
-        num_rows = sum(all_rank_num_tokens)
-        return (num_rows + self.moe_max_num_tokens -
-                1) // self.moe_max_num_tokens
-
-    def can_use_alltoall(self, all_rank_num_tokens, all_rank_max_num_tokens):
-        # Disable alltoall when chunking is used
-        if self.calculate_num_chunks(all_rank_num_tokens) > 1:
-            return False
-
+    def can_use_alltoall(self, all_rank_max_num_tokens):
         # For DeepEPLowLatency, check if tokens exceed the threshold
         if (self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency
                 and all_rank_max_num_tokens > self.deep_ep_max_num_tokens):
@@ -348,43 +318,17 @@ class WideEPMoE(MoE):
         dummy_tensor = self.all_reduce(dummy_tensor)
         return dummy_tensor
 
-    def reducescatter_or_allreduce(
+    def prepare_fused_moe(
         self,
-        inputs,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
         use_all_to_all: bool,
+        output_dtype: torch.dtype,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
-        outputs = inputs
-        if not use_all_to_all:
-            if self.enable_dummy_allreduce:
-                self.dummy_allreduce()
-            outputs = reducescatter(
-                inputs,
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
-        return outputs
-
-    def forward_chunk(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            use_all_to_all: bool,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            all_rank_max_num_tokens: Optional[int] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: Tuple = (True, True),
+        all_rank_max_num_tokens: Optional[int] = None,
+        is_first_call: bool = True,
+        is_last_call: bool = True,
     ) -> torch.Tensor:
-        if isinstance(x, Fp4QuantizedTensor):
-            assert output_dtype is not None
-            output_dtype = output_dtype
-        else:
-            output_dtype = x.dtype
-
-        is_first_call, is_last_call = repeating_info
-
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
@@ -447,26 +391,30 @@ class WideEPMoE(MoE):
         # Only the non-alltoall case is considered for profiling in the warmup phase.
         # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
         if use_all_to_all:
-            if all_rank_num_tokens is not None:
-                tuner_num_tokens = sum(all_rank_num_tokens)
-            else:
-                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_num_tokens = sum(all_rank_num_tokens)
             tuner_top_k = token_selected_slots.shape[1]
         else:
             tuner_num_tokens = None
             tuner_top_k = None
+
+        outputs = {
+            key: None
+            for key in [
+                "alltoall_info", "token_count", "padded", "deep_ep_handle", "deep_ep_hook_dispatch", "deep_ep_recv_expert_count",
+                "deep_ep_topk_idx", "deep_ep_topk_weights"
+            ]
+        }
         if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
-                token_count = x.shape[0]
-                alltoall_info = None
+                outputs["token_count"] = x.shape[0]
                 if is_last_call:
                     loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                     )
                 else:
                     loadbalancer_local_statistic_info = None
-                x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
+                x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, outputs["alltoall_info"] = \
                     self.alltoall_prepare_maybe_dispatch(all_rank_max_num_tokens,
                                                          x,
                                                          token_selected_slots,
@@ -475,45 +423,46 @@ class WideEPMoE(MoE):
                                                          loadbalancer_local_statistic_info)
                 if gathered_loadbalancer_local_statistic_info is not None:
                     gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
-                        (self.mapping.moe_ep_size, self.num_experts))
+                        (self.ep_size, self.num_experts))
                     self.layer_load_balancer.update_statistic_with_gathered_statistic(
                         gathered_loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not use_postquant_alltoall:
-                    x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
+                    x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, outputs["deep_ep_handle"] = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots, token_final_scales, self.num_slots,
-                        self.expert_size_per_partition * self.mapping.moe_ep_rank)
-                    padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
-                        x, None, recv_topk_idx, token_final_scales)
+                        self.expert_size_per_partition * self.ep_rank)
+                    outputs[
+                        "padded"], x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
+                            x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not use_postquant_alltoall:
-                    deep_ep_topk_idx = token_selected_slots
-                    deep_ep_topk_weights = token_final_scales
+                    outputs["deep_ep_topk_idx"] = token_selected_slots
+                    outputs["deep_ep_topk_weights"] = token_final_scales
                     assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                    x, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    x, outputs["deep_ep_recv_expert_count"], outputs["deep_ep_handle"], outputs["deep_ep_hook_dispatch"] = \
+                        self.deep_ep_buffer.low_latency_dispatch(x, outputs["deep_ep_topk_idx"], self.deep_ep_max_num_tokens, self.num_slots)
                     # x shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
-                    # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
-                    # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
-                    mask = torch.arange(
-                        x.shape[1], dtype=torch.int32, device=x.device).expand(
-                            x.shape[0],
-                            x.shape[1]) < recv_expert_count.unsqueeze(1)
-                    token_selected_slots = torch.where(
-                        mask,
-                        torch.arange(
-                            x.shape[0] * self.mapping.moe_ep_rank,
-                            x.shape[0] * (self.mapping.moe_ep_rank + 1),
-                            dtype=torch.int32,
-                            device=x.device).unsqueeze(1), self.num_slots)
-                    x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-                    # Cheat the fused_moe API with fake top_k=1
-                    token_selected_slots = token_selected_slots.view(
-                        x.shape[0], 1)
-                    token_final_scales = torch.ones_like(
-                        token_selected_slots, dtype=token_final_scales.dtype)
+                    # # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
+                    # # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+                    # mask = torch.arange(
+                    #     x.shape[1], dtype=torch.int32, device=x.device).expand(
+                    #         x.shape[0],
+                    #         x.shape[1]) < recv_expert_count.unsqueeze(1)
+                    # token_selected_slots = torch.where(
+                    #     mask,
+                    #     torch.arange(
+                    #         x.shape[0] * self.ep_rank,
+                    #         x.shape[0] * (self.ep_rank + 1),
+                    #         dtype=torch.int32,
+                    #         device=x.device).unsqueeze(1), self.num_slots)
+                    # x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                    # # Cheat the fused_moe API with fake top_k=1
+                    # token_selected_slots = token_selected_slots.view(
+                    #     x.shape[0], 1)
+                    # token_final_scales = torch.ones_like(
+                    #     token_selected_slots, dtype=token_final_scales.dtype)
 
         x_sf = None
         x_row = x.shape[0]
@@ -536,11 +485,8 @@ class WideEPMoE(MoE):
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x,
-                            self.fc31_input_scale,
-                            self.scaling_vector_size,
-                            sfUseUE8M0=False,
-                            swizzedLayout=False)
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
@@ -566,32 +512,25 @@ class WideEPMoE(MoE):
                 ],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=all_rank_num_tokens)
             x_row = x.shape[0]
-
-        ep_size = self.ep_size
-        ep_rank = self.ep_rank
-        w3_w1_weight = self.w3_w1_weight
-        w2_weight = self.w2_weight
-        cluster_size = self.cluster_size
-        cluster_rank = self.cluster_rank
-        quant_scales = self.quant_scales
 
         if use_postquant_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
-                    x, x_sf, alltoall_info)
+                    x, x_sf, outputs["alltoall_info"])
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
                     x_sf_dtype = x_sf.dtype
                     x_sf = x_sf.view(torch.float32)
-                (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
+                (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, outputs["deep_ep_handle"] = \
                     self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots, token_final_scales, self.num_slots,
-                    self.expert_size_per_partition * self.mapping.moe_ep_rank)
-                padded, x, x_sf, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
-                    x, x_sf, recv_topk_idx, token_final_scales)
+                    self.expert_size_per_partition * self.ep_rank)
+                outputs[
+                    "padded"], x, x_sf, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
+                        x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
@@ -604,12 +543,12 @@ class WideEPMoE(MoE):
                     1] == hidden_size // 16
                 assert x.shape[0] == token_num and x.shape[1] == hidden_size // 2
 
-                deep_ep_topk_idx = token_selected_slots
-                deep_ep_topk_weights = token_final_scales
+                outputs["deep_ep_topk_idx"] = token_selected_slots
+                outputs["deep_ep_topk_weights"] = token_final_scales
 
                 assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                x, x_sf, recv_expert_count, deep_ep_handle = \
-                    self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                x, x_sf, recv_expert_count, outputs["deep_ep_handle"] = \
+                    self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, outputs["deep_ep_topk_idx"], self.deep_ep_max_num_tokens, self.num_slots)
                 assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
                 assert x.dim() == 3 and x_sf.dim() == 3
                 assert x.shape[2] == hidden_size // 2 and x_sf.shape[
@@ -620,8 +559,8 @@ class WideEPMoE(MoE):
                         x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
                 token_selected_slots = torch.where(
                     mask,
-                    torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
-                                 x.shape[0] * (self.mapping.moe_ep_rank + 1),
+                    torch.arange(x.shape[0] * self.ep_rank,
+                                 x.shape[0] * (self.ep_rank + 1),
                                  dtype=torch.int32,
                                  device=x.device).unsqueeze(1), self.num_slots)
                 x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
@@ -635,220 +574,325 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
+        outputs.update({
+            "x": x,
+            "x_sf": x_sf,
+            "token_selected_slots": token_selected_slots,
+            "token_final_scales": token_final_scales,
+            "use_deepseek_fp8_block_scale": use_deepseek_fp8_block_scale,
+            "use_w4_group_scaling": use_w4_group_scaling,
+            "tuner_num_tokens": tuner_num_tokens,
+            "tuner_top_k": tuner_top_k,
+            "weight_dtype": weight_dtype,
+            "use_all_to_all": use_all_to_all,
+            "output_dtype": output_dtype,
+            "all_rank_num_tokens": all_rank_num_tokens,
+            "is_first_call": is_first_call,
+            "is_last_call": is_last_call,
+        })
+
+        return outputs
+
+    def run_fused_moe(self, fused_moe_params: Dict[str, Any]):
+        if fused_moe_params["deep_ep_hook_dispatch"] is not None:
+            fused_moe_params["deep_ep_hook_dispatch"]()
+        x = fused_moe_params["x"]
+        token_selected_slots = fused_moe_params["token_selected_slots"]
+        token_final_scales = fused_moe_params["token_final_scales"]
+        if fused_moe_params["deep_ep_recv_expert_count"] is not None:
+            # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
+            # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+            mask = torch.arange(
+                x.shape[1], dtype=torch.int32, device=x.device).expand(
+                    x.shape[0],
+                    x.shape[1]) < fused_moe_params["deep_ep_recv_expert_count"].unsqueeze(1)
+            token_selected_slots = torch.where(
+                mask,
+                torch.arange(
+                    x.shape[0] * self.ep_rank,
+                    x.shape[0] * (self.ep_rank + 1),
+                    dtype=torch.int32,
+                    device=x.device).unsqueeze(1), self.num_slots)
+            x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+            # Cheat the fused_moe API with fake top_k=1
+            token_selected_slots = token_selected_slots.view(
+                x.shape[0], 1)
+            token_final_scales = torch.ones_like(
+                token_selected_slots, dtype=token_final_scales.dtype)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_slots,
             token_final_scales,
-            w3_w1_weight.view(weight_dtype),
+            self.w3_w1_weight.view(fused_moe_params["weight_dtype"]),
             None,  # w3_w1_bias
-            w2_weight.view(weight_dtype),
+            self.w2_weight.view(fused_moe_params["weight_dtype"]),
             None,  # w2_bias
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
+            fused_moe_params["output_dtype"],
+            quant_scales=self.quant_scales,
+            input_sf=fused_moe_params["x_sf"],
             swizzled_input_sf=False,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            enable_alltoall=fused_moe_params["use_all_to_all"],
+            use_deepseek_fp8_block_scale=fused_moe_params[
+                "use_deepseek_fp8_block_scale"],
+            use_w4_group_scaling=fused_moe_params["use_w4_group_scaling"],
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
+            tuner_num_tokens=fused_moe_params["tuner_num_tokens"],
+            tuner_top_k=fused_moe_params["tuner_top_k"],
         )
-
-        if self.layer_load_balancer and is_last_call:
-            self.layer_load_balancer.start_set_cpu_stage()
 
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
 
-        if use_all_to_all:
+        return final_hidden_states
+
+    def finalize_fused_moe(
+        self,
+        inputs: torch.Tensor,
+        fused_moe_params: Dict[str, Any],
+    ) -> torch.Tensor:
+        if self.layer_load_balancer and fused_moe_params["is_last_call"]:
+            self.layer_load_balancer.start_set_cpu_stage()
+
+        if self.enable_dummy_allreduce:
+            self.dummy_allreduce()
+        combine_hook = None
+        if fused_moe_params["use_all_to_all"]:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                if self.enable_dummy_allreduce:
-                    self.dummy_allreduce()
-                final_hidden_states = self.alltoall_combine(
-                    final_hidden_states, alltoall_info, token_count)
+                outputs = self.alltoall_combine(
+                    inputs, fused_moe_params["alltoall_info"],
+                    fused_moe_params["token_count"])
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                final_hidden_states = self.unpad_tensors(
-                    padded, final_hidden_states)
-                final_hidden_states = self.deep_ep_buffer.combine(
-                    final_hidden_states, deep_ep_handle)
+                inputs = self.unpad_tensors(fused_moe_params["padded"], inputs)
+                outputs = self.deep_ep_buffer.combine(
+                    inputs, fused_moe_params["deep_ep_handle"])
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                num_tokens_per_expert_for_fused_moe = self.mapping.moe_ep_size * all_rank_max_num_tokens
-                final_hidden_states = final_hidden_states.view(
-                    self.expert_size_per_partition,
-                    num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                    final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
-                    deep_ep_handle)
+                num_tokens_per_expert_for_fused_moe = self.ep_size * self.deep_ep_max_num_tokens
+                inputs = inputs.view(self.expert_size_per_partition,
+                                     num_tokens_per_expert_for_fused_moe,
+                                     self.hidden_size)
+                outputs, combine_hook = self.deep_ep_buffer.low_latency_combine(
+                    inputs, fused_moe_params["deep_ep_topk_idx"],
+                    fused_moe_params["deep_ep_topk_weights"],
+                    fused_moe_params["deep_ep_handle"])
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
+        else:
+            outputs = self.reducescatter_or_allreduce(
+                inputs, fused_moe_params["all_rank_num_tokens"])
 
-        if self.layer_load_balancer and is_last_call:
+        if self.layer_load_balancer and fused_moe_params["is_last_call"]:
             self.layer_load_balancer.done_set_cpu_stage()
 
-        return final_hidden_states
+        return outputs, combine_hook
 
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        do_finalize: bool = True,
+        do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         all_rank_max_num_tokens: Optional[int] = None,
-        use_dp_padding: Optional[bool] = None,
+        idx_overlap: Optional[int] = None,
+        idx_mode: Optional[int] = None,
+        fused_moe_params: Optional[Dict[str, Any]] = None,
+        outputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert all_rank_num_tokens is not None
-        assert use_dp_padding is not None
+        assert do_finalize, "WideEPMoE does not support do_finalize=False"
+        assert all_rank_num_tokens is not None, "all_rank_num_tokens should be provided because attention DP is enabled"
+        if all_rank_max_num_tokens is None:
+            all_rank_max_num_tokens = max(all_rank_num_tokens)
+        if output_dtype is None:
+            assert not isinstance(x, Fp4QuantizedTensor)
+            output_dtype = x.dtype
 
-        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
-        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens,
-                                               all_rank_max_num_tokens)
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
-                                          ] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
+        num_chunks = self.compute_num_chunks(x, all_rank_num_tokens)
+        use_all_to_all = self.can_use_alltoall(all_rank_max_num_tokens)
+        if idx_overlap is not None:
+            assert num_chunks == 1
         if num_chunks == 1:
-            is_first_call = self.repeat_idx == 0
-            is_last_call = self.repeat_idx == self.repeat_count - 1
-            outputs = self.forward_chunk(
-                x,
-                router_logits,
-                use_all_to_all,
-                output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                all_rank_max_num_tokens=all_rank_max_num_tokens,
-                use_dp_padding=use_dp_padding,
-                repeating_info=(is_first_call, is_last_call))
-            outputs = self.reducescatter_or_allreduce(
-                outputs,
-                use_all_to_all,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
-        else:
-
-            def split_chunk(split_token_num: int, split_num_chunks: int):
-                val_div = split_token_num // split_num_chunks
-                val_mod = split_token_num % split_num_chunks
-                split_chunk_size_list = [val_div + 1] * val_mod + [val_div] * (
-                    split_num_chunks - val_mod)
-                return split_chunk_size_list
-
-            all_rank_chunk_size_list = [
-                split_chunk(val, num_chunks)
-                for val in all_rank_num_tokens_padded
-            ]
-            all_rank_num_tokens_list = [[
-                val[idx_chunk] for val in all_rank_chunk_size_list
-            ] for idx_chunk in range(num_chunks)]
-            all_rank_max_num_tokens_list = split_chunk(all_rank_max_num_tokens,
-                                                       num_chunks)
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
-            if use_all_to_all:
-                all_rank_num_tokens_list = [[
-                    1 if val == 0 else val for val in val_list
-                ] for val_list in all_rank_num_tokens_list]
-                all_rank_max_num_tokens_list = [
-                    1 if val == 0 else val
-                    for val in all_rank_max_num_tokens_list
-                ]
-
-            x_list = x.split(chunk_size_list)
-            router_logits_list = router_logits.split(chunk_size_list)
-
-            if not use_all_to_all:
-                self.event_dict[EventType.Main].record()
-                with torch.cuda.stream(self.aux_stream):
-                    self.event_dict[EventType.Main].wait()
-
-            outputs_list = []
-            # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
-                is_first_call = idx_chunk == 0 and self.repeat_idx == 0
-                is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
-                if not use_all_to_all:
-                    if idx_chunk % 2 == 0:
-                        with torch.cuda.stream(self.aux_stream):
-                            outputs = self.forward_chunk(
-                                x,
-                                router_logits,
-                                use_all_to_all,
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk],
-                                all_rank_max_num_tokens=
-                                all_rank_max_num_tokens_list[idx_chunk],
-                                use_dp_padding=use_dp_padding,
-                                repeating_info=(is_first_call, is_last_call))
-                        if idx_chunk > 0:
-                            outputs_list[-1] = self.reducescatter_or_allreduce(
-                                outputs_list[-1],
-                                use_all_to_all,
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk - 1],
-                                use_dp_padding=use_dp_padding)
-                    else:
-                        outputs = self.forward_chunk(
-                            x,
-                            router_logits,
-                            use_all_to_all,
-                            all_rank_num_tokens=all_rank_num_tokens_list[
-                                idx_chunk],
-                            all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                                idx_chunk],
-                            use_dp_padding=use_dp_padding,
-                            repeating_info=(is_first_call, is_last_call))
-                        with torch.cuda.stream(self.aux_stream):
-                            outputs_list[-1] = self.reducescatter_or_allreduce(
-                                outputs_list[-1],
-                                use_all_to_all,
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk - 1],
-                                use_dp_padding=use_dp_padding)
-                else:
-                    outputs = self.forward_chunk(
+            is_first_call = self.repeat_idx == 0 and (idx_overlap is None or idx_overlap == 0)
+            is_last_call = self.repeat_idx == self.repeat_count - 1 and (idx_overlap is None or idx_overlap == 1)
+            if idx_overlap is None or idx_mode is None:
+                fused_moe_params = self.prepare_fused_moe(
+                    x,
+                    router_logits,
+                    use_all_to_all,
+                    output_dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    all_rank_max_num_tokens=all_rank_max_num_tokens,
+                    is_first_call=is_first_call,
+                    is_last_call=is_last_call)
+                outputs = self.run_fused_moe(fused_moe_params)
+                outputs, hook_combine = self.finalize_fused_moe(outputs, fused_moe_params)
+                if hook_combine is not None:
+                    hook_combine()
+            else:
+                assert self.repeat_count == 1
+                if idx_mode == 0:
+                    assert fused_moe_params is None
+                    assert outputs is None
+                    fused_moe_params = self.prepare_fused_moe(
                         x,
                         router_logits,
                         use_all_to_all,
-                        all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
-                        all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                            idx_chunk],
-                        repeating_info=(is_first_call, is_last_call))
-
-                outputs_list.append(outputs)
-            if not use_all_to_all:
-                if num_chunks % 2 == 0:
-                    outputs_list[-1] = self.reducescatter_or_allreduce(
-                        outputs_list[-1],
-                        use_all_to_all,
-                        all_rank_num_tokens=all_rank_num_tokens_list[-1],
-                        use_dp_padding=use_dp_padding)
+                        output_dtype,
+                        all_rank_num_tokens=all_rank_num_tokens,
+                        all_rank_max_num_tokens=all_rank_max_num_tokens,
+                        is_first_call=is_first_call,
+                        is_last_call=is_last_call)
+                    return fused_moe_params
+                elif idx_mode == 1:
+                    assert fused_moe_params is not None
+                    assert outputs is None
+                    outputs = self.run_fused_moe(fused_moe_params)
+                    return outputs
+                elif idx_mode == 2:
+                    assert fused_moe_params is not None
+                    assert outputs is not None
+                    outputs, hook_combine = self.finalize_fused_moe(outputs, fused_moe_params)
+                    return outputs, hook_combine
                 else:
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1],
-                            use_all_to_all,
-                            all_rank_num_tokens=all_rank_num_tokens_list[-1],
-                            use_dp_padding=use_dp_padding)
+                    raise ValueError(f"Invalid idx_mode: {idx_mode}")
+        else:
+            all_rank_chunk_size_list = [
+                self.compute_chunk_size_list(val, num_chunks)
+                for val in all_rank_num_tokens
+            ]
+            all_rank_max_num_tokens_list = self.compute_chunk_size_list(
+                all_rank_max_num_tokens, num_chunks)
+            all_rank_nonzero_tokens_list = [[
+                max(val[idx_chunk], 1) for val in all_rank_chunk_size_list
+            ] for idx_chunk in range(num_chunks)]
+            chunk_size_list = all_rank_chunk_size_list[self.rank]
+
+            x_list = self.split_tensor_maybe_with_dummy(x, chunk_size_list)
+            router_logits_list = self.split_tensor_maybe_with_dummy(
+                router_logits, chunk_size_list)
+
+            self.event_dict[EventType.Main].record()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+
+            def _prepare_fused_moe(idx):
+                is_first_call = idx == 0 and self.repeat_idx == 0 and (idx_overlap is None or idx_overlap == 0)
+                is_last_call = idx == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1 and (idx_overlap is None or idx_overlap == 1)
+                return self.prepare_fused_moe(
+                    x_list[idx],
+                    router_logits_list[idx],
+                    use_all_to_all,
+                    output_dtype,
+                    all_rank_num_tokens=all_rank_nonzero_tokens_list[idx],
+                    all_rank_max_num_tokens=all_rank_max_num_tokens_list[idx],
+                    is_first_call=is_first_call,
+                    is_last_call=is_last_call)
+
+            # wait_aux, run[0], finalize[0], prepare[2], record_main,                                                         wait_aux, hook_combine[0], run[2], finalize[2], prepare[4], record_main,                                                              wait_aux, hook_combine[2], run[4], finalize[4], record_main,                             hook_combine[4]
+            #                                                         wait_main, run[1], finalize[1], prepare[3], record_aux,                                                                          wait_main, hook_combine[1], run[3], finalize[3], record_aux,                                                              wait_main, hook_combine[3],
+
+            outputs_list, hook_combine_list = [], []
+            if num_chunks == 2:
+                fused_moe_params_main = _prepare_fused_moe(0)
+                if fused_moe_params_main["deep_ep_hook_dispatch"] is not None:
+                    fused_moe_params_main["deep_ep_hook_dispatch"]()
+                    fused_moe_params_main["deep_ep_hook_dispatch"] = None
+                self.event_dict[EventType.Main].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.Main].wait()
+                    fused_moe_params_aux = _prepare_fused_moe(1)
+                    self.event_dict[EventType.MoeChunkingOverlap].record()
+                self.event_dict[EventType.MoeChunkingOverlap].wait()
+                outputs_main = self.run_fused_moe(fused_moe_params_main)
+                self.event_dict[EventType.Main].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.Main].wait()
+                    if fused_moe_params_aux["deep_ep_hook_dispatch"] is not None:
+                        fused_moe_params_aux["deep_ep_hook_dispatch"]()
+                        fused_moe_params_aux["deep_ep_hook_dispatch"] = None
+                    self.event_dict[EventType.MoeChunkingOverlap].record()
+                self.event_dict[EventType.MoeChunkingOverlap].wait()
+                outputs_main, hook_combine_main = self.finalize_fused_moe(
+                    outputs_main, fused_moe_params_main)
+                outputs_list.append(outputs_main)
+                hook_combine_list.append(hook_combine_main)
+                outputs_aux = self.run_fused_moe(fused_moe_params_aux)
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.MoeChunkingOverlap].record()
                 self.event_dict[EventType.MoeChunkingOverlap].wait()
+                if hook_combine_main is not None:
+                    hook_combine_main()
+                self.event_dict[EventType.Main].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.Main].wait()
+                    outputs_aux, hook_combine_aux = self.finalize_fused_moe(
+                        outputs_aux, fused_moe_params_aux)
+                    outputs_list.append(outputs_aux)
+                    hook_combine_list.append(hook_combine_aux)
+                    if hook_combine_aux is not None:
+                        hook_combine_aux()
+            else:
+                fused_moe_params_main = _prepare_fused_moe(0)
+                self.event_dict[EventType.Main].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.Main].wait()
+                    fused_moe_params_aux = _prepare_fused_moe(1)
+                    self.event_dict[EventType.MoeChunkingOverlap].record()
+                for idx_chunk in range(num_chunks):
+                    if idx_chunk % 2 == 0:
+                        self.event_dict[EventType.MoeChunkingOverlap].wait()
+                        if idx_chunk - 2 >= 0 and hook_combine_list[idx_chunk - 2] is not None:
+                            hook_combine_list[idx_chunk - 2]()
+                        outputs_main = self.run_fused_moe(fused_moe_params_main)
+                        outputs_main, hook_combine_main = self.finalize_fused_moe(
+                            outputs_main, fused_moe_params_main)
+                        outputs_list.append(outputs_main)
+                        hook_combine_list.append(hook_combine_main)
+                        if idx_chunk + 2 < num_chunks:
+                            fused_moe_params_main = _prepare_fused_moe(idx_chunk + 2)
+                        self.event_dict[EventType.Main].record()
+                    else:
+                        with torch.cuda.stream(self.aux_stream):
+                            self.event_dict[EventType.Main].wait()
+                            if idx_chunk - 2 >= 0 and hook_combine_list[idx_chunk - 2] is not None:
+                                hook_combine_list[idx_chunk - 2]()
+                            outputs_aux = self.run_fused_moe(fused_moe_params_aux)
+                            outputs_aux, hook_combine_aux = self.finalize_fused_moe(
+                                outputs_aux, fused_moe_params_aux)
+                            outputs_list.append(outputs_aux)
+                            hook_combine_list.append(hook_combine_aux)
+                            if idx_chunk + 2 < num_chunks:
+                                fused_moe_params_aux = _prepare_fused_moe(idx_chunk + 2)
+                            self.event_dict[EventType.MoeChunkingOverlap].record()
+                if num_chunks % 2 == 0:
+                    self.event_dict[EventType.MoeChunkingOverlap].wait()
+                    if hook_combine_list[-2] is not None:
+                        hook_combine_list[-2]()
+                    with torch.cuda.stream(self.aux_stream):
+                        if hook_combine_list[-1] is not None:
+                            hook_combine_list[-1]()
+                else:
+                    with torch.cuda.stream(self.aux_stream):
+                        self.event_dict[EventType.Main].wait()
+                        if hook_combine_list[-2] is not None:
+                            hook_combine_list[-2]()
+                    if hook_combine_list[-1] is not None:
+                        hook_combine_list[-1]()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.MoeChunkingOverlap].record()
+            self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
-        rank = self.mapping.tp_rank
-        outputs = outputs[:all_rank_num_tokens[rank]]
+            # Dummy tensors may be used and need to be discarded when attention DP is enabled.
+            outputs = outputs[:all_rank_num_tokens[self.rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
 

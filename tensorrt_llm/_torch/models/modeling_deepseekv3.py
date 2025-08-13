@@ -29,7 +29,7 @@ import copy
 import math
 import os
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -521,9 +521,8 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, all_rank_max_num_tokens,
-                              do_finalize):
+                              do_finalize, idx_overlap, idx_mode=None, fused_moe_params=None, outputs=None):
         # max-throughput
-        use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
@@ -540,10 +539,46 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=use_dp_padding,
+            idx_overlap=idx_overlap,
+            idx_mode=idx_mode,
+            fused_moe_params=fused_moe_params,
+            outputs=outputs,
         )
 
         return routed_output
+
+    def forward_shared(self, hidden_states, hidden_states_fp4):
+        self.event_dict[EventType.Main].record()
+        with torch.cuda.stream(self.aux_stream):
+            self.event_dict[EventType.Main].wait()
+            shared_output = self.shared_experts(hidden_states_fp4
+                                                    or hidden_states)
+            if self.shared_output_scale is not None:
+                shared_output *= self.shared_output_scale
+            self.event_dict[EventType.MoeShared].record()
+        return shared_output
+
+    def forward_routed(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
+        all_rank_num_tokens: Optional[list[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
+        do_finalize: Optional[bool] = True,
+        idx_overlap: Optional[int] = None,
+        idx_mode: Optional[int] = None,
+        fused_moe_params: Optional[Dict[str, Any]] = None,
+        outputs: Optional[torch.Tensor] = None,
+    ):
+        return self.compute_routed_output(hidden_states,
+                                          hidden_states_fp4,
+                                          all_rank_num_tokens,
+                                          all_rank_max_num_tokens,
+                                          do_finalize,
+                                          idx_overlap,
+                                          idx_mode,
+                                          fused_moe_params,
+                                          outputs)
 
     def forward(
         self,
@@ -553,6 +588,7 @@ class Deepseekv3MoE(nn.Module):
         all_rank_max_num_tokens: Optional[int] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        idx_overlap: Optional[int] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
@@ -569,7 +605,8 @@ class Deepseekv3MoE(nn.Module):
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
                                                        all_rank_max_num_tokens,
-                                                       do_finalize)
+                                                       do_finalize,
+                                                       idx_overlap)
             return routed_output
 
         routed_output, shared_output = maybe_execute_in_parallel(
@@ -686,6 +723,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeChunkingOverlap]
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -738,46 +776,275 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        residual: torch.Tensor,
+        position_ids: Union[torch.IntTensor, Tuple[torch.IntTensor, torch.IntTensor]],
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        attn_metadata: Union[AttentionMetadata, Tuple[AttentionMetadata, AttentionMetadata]],
+        residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        idx_layer: Optional[int] = None,
+        num_layers: Optional[int] = None,
+        event_dict: Optional[Dict[EventType, torch.cuda.Event]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.disable_attn_allreduce)),
-            **kwargs,
-        )
+        use_overlap = isinstance(position_ids, tuple)
+        if use_overlap:
+            assert isinstance(hidden_states, tuple)
+            assert isinstance(attn_metadata, tuple)
+            assert isinstance(residual, tuple)
+            assert len(position_ids) == len(hidden_states) == len(attn_metadata) == len(residual) == 2
+        else:
+            assert not isinstance(hidden_states, tuple)
+            assert not isinstance(attn_metadata, tuple)
+            assert not isinstance(residual, tuple)
 
-        if isinstance(self.mlp, Deepseekv3MoE):
-            return self.forward_MoE(
+        if not use_overlap:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            # Self Attention
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                residual=residual,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
             )
+
+            if isinstance(self.mlp, Deepseekv3MoE):
+                return self.forward_MoE(
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
+            else:
+                assert isinstance(self.mlp, GatedMLP)
+                return self.forward_mlp(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
         else:
-            assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            residual_0, residual_1 = residual
+            hidden_states_0, hidden_states_1 = hidden_states
+            if idx_layer == 0:
+                assert hidden_states_0 is not None and hidden_states_1 is not None
+                assert residual_0 is None and residual_1 is None
+                residual_0, residual_1 = hidden_states_0, hidden_states_1
+                event_dict["finalize_1_args"] = None
+            else:
+                if event_dict["finalize_1_args"] is not None:
+                    assert hidden_states_0 is not None and hidden_states_1 is None
+                else:
+                    assert hidden_states_0 is not None and hidden_states_1 is not None
+
+            if isinstance(self.mlp, Deepseekv3MoE):
+
+                def _run_self_attn(hidden_states, residual, idx_overlap):
+                    hidden_states = self.self_attn(
+                        position_ids=position_ids[idx_overlap],
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata[idx_overlap],
+                        all_reduce_params=AllReduceParams(
+                            enable_allreduce=not (self.disable_attn_allreduce)),
+                        idx_overlap=idx_overlap,
+                        **kwargs,
+                    )
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual)
+                    return hidden_states, residual
+
+                def _run_moe_shared(hidden_states):
+                    outputs = self.mlp.forward_shared(
+                        hidden_states,
+                        None,
+                    )
+                    return outputs
+
+                def _dispatch_moe_routed(hidden_states, idx_overlap):
+                    fused_moe_params = self.mlp.forward_routed(
+                        hidden_states,
+                        None,
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        do_finalize=True,
+                        idx_overlap=idx_overlap,
+                        idx_mode=0,
+                        fused_moe_params=None,
+                        outputs=None,
+                    )
+                    return fused_moe_params
+
+                def _run_moe_routed(hidden_states, fused_moe_params, idx_overlap):
+                    outputs = self.mlp.forward_routed(
+                        hidden_states,
+                        None,
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        do_finalize=True,
+                        idx_overlap=idx_overlap,
+                        idx_mode=1,
+                        fused_moe_params=fused_moe_params,
+                        outputs=None,
+                    )
+                    return outputs
+
+                def _combine_moe_routed(hidden_states, fused_moe_params, outputs, idx_overlap):
+                    outputs, hook_combine = self.mlp.forward_routed(
+                        hidden_states,
+                        None,
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        do_finalize=True,
+                        idx_overlap=idx_overlap,
+                        idx_mode=2,
+                        fused_moe_params=fused_moe_params,
+                        outputs=outputs,
+                    )
+                    return outputs, hook_combine
+
+                def _sync_dispatch(fused_moe_params):
+                    if fused_moe_params["deep_ep_hook_dispatch"] is not None:
+                        fused_moe_params["deep_ep_hook_dispatch"]()
+                        fused_moe_params["deep_ep_hook_dispatch"] = None
+                    return
+
+                def _finalize(routed_outputs, shared_outputs, residual, hook_combine):
+                    if hook_combine is not None:
+                        hook_combine()
+                    hidden_states = shared_outputs + routed_outputs
+                    if self.next_layer_layernorm is not None:
+                        hidden_states, residual = self.next_layer_layernorm(
+                            hidden_states, residual)
+                    return hidden_states, residual
+
+                # Attention 0
+                if idx_layer == 0:
+                    hidden_states_0 = self.input_layernorm(hidden_states_0)
+                hidden_states_0, residual_0 = _run_self_attn(hidden_states_0, residual_0, idx_overlap=0)
+                # Done combine and finalize 1 in the previous layer
+                if event_dict["finalize_1_args"] is not None:
+                    event_dict[EventType.Main].record()
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                        hidden_states_1, residual_1 = _finalize(*event_dict["finalize_1_args"])
+                        event_dict[EventType.MoeChunkingOverlap].record()
+                    event_dict["finalize_1_args"] = None
+                # Start dispatch 0
+                if idx_layer > 0:
+                    event_dict[EventType.MoeChunkingOverlap].wait()
+                fused_moe_params_0 = _dispatch_moe_routed(hidden_states_0, idx_overlap=0)
+                event_dict[EventType.Main].record()
+                # Attention 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    if idx_layer == 0:
+                        hidden_states_1 = self.input_layernorm(hidden_states_1)
+                    hidden_states_1, residual_1 = _run_self_attn(hidden_states_1, residual_1, idx_overlap=1)
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                # Done dispatch 0
+                event_dict[EventType.MoeChunkingOverlap].wait()
+                _sync_dispatch(fused_moe_params_0)
+                event_dict[EventType.Main].record()
+                # Start dispatch 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    fused_moe_params_1 = _dispatch_moe_routed(hidden_states_1, idx_overlap=1)
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                # MoE 0
+                event_dict[EventType.MoeChunkingOverlap].wait()
+                shared_outputs_0 = _run_moe_shared(hidden_states_0)
+                routed_outputs_0 = _run_moe_routed(hidden_states_0, fused_moe_params_0, idx_overlap=0)
+                self.mlp.event_dict[EventType.MoeShared].wait()
+                event_dict[EventType.Main].record()
+                # Done dispatch 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    _sync_dispatch(fused_moe_params_1)
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                # Start combine 0
+                event_dict[EventType.MoeChunkingOverlap].wait()
+                routed_outputs_0, hook_combine_0 = _combine_moe_routed(hidden_states_0, fused_moe_params_0, routed_outputs_0, idx_overlap=0)
+                event_dict[EventType.Main].record()
+                # MoE 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    shared_output_1 = _run_moe_shared(hidden_states_1)
+                    routed_outputs_1 = _run_moe_routed(hidden_states_1, fused_moe_params_1, idx_overlap=1)
+                    self.mlp.event_dict[EventType.MoeShared].wait()
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                # Done combine and finalize 0
+                event_dict[EventType.MoeChunkingOverlap].wait()
+                hidden_states_0, residual_0 = _finalize(routed_outputs_0, shared_outputs_0, residual_0, hook_combine_0)
+                event_dict[EventType.Main].record()
+                # Start combine 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    routed_outputs_1, hook_combine_1 = _combine_moe_routed(hidden_states_1, fused_moe_params_1, routed_outputs_1, idx_overlap=1)
+                # Done combine and finalize 1 or prepare for the next layer
+                with torch.cuda.stream(self.aux_stream):
+                    if idx_layer == num_layers - 1:
+                        hidden_states_1, residual_1 = _finalize(routed_outputs_1, shared_output_1, residual_1, hook_combine_1)
+                    else:
+                        event_dict["finalize_1_args"] = (routed_outputs_1, shared_output_1, residual_1, hook_combine_1)
+                        hidden_states_1, residual_1 = None, None
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                event_dict[EventType.MoeChunkingOverlap].wait()
+            else:
+                assert isinstance(self.mlp, GatedMLP)
+                if idx_layer == 0:
+                    hidden_states_0 = self.input_layernorm(hidden_states_0)
+                hidden_states_0 = self.self_attn(
+                    position_ids=position_ids[0],
+                    hidden_states=hidden_states_0,
+                    attn_metadata=attn_metadata[0],
+                    all_reduce_params=AllReduceParams(
+                        enable_allreduce=not (self.disable_attn_allreduce)),
+                    idx_overlap=0,
+                    **kwargs,
+                )
+                event_dict[EventType.Main].record()
+                if idx_layer > 0:
+                    event_dict[EventType.MoeChunkingOverlap].wait()
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    if idx_layer == 0:
+                        hidden_states_1 = self.input_layernorm(hidden_states_1)
+                    hidden_states_1 = self.self_attn(
+                        position_ids=position_ids[1],
+                        hidden_states=hidden_states_1,
+                        attn_metadata=attn_metadata[1],
+                        all_reduce_params=AllReduceParams(
+                            enable_allreduce=not (self.disable_attn_allreduce)),
+                        idx_overlap=1,
+                        **kwargs,
+                    )
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                hidden_states_0, residual_0 = self.forward_mlp(
+                    hidden_states=hidden_states_0,
+                    residual=residual[0],
+                )
+                event_dict[EventType.Main].record()
+                event_dict[EventType.MoeChunkingOverlap].wait()
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    hidden_states_1, residual_1 = self.forward_mlp(
+                        hidden_states=hidden_states_1,
+                        residual=residual[1],
+                    )
+                    event_dict[EventType.MoeChunkingOverlap].record()
+                if idx_layer == num_layers - 1:
+                    event_dict[EventType.MoeChunkingOverlap].wait()
+
+            return (hidden_states_0, hidden_states_1), (residual_0, residual_1)
 
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+        idx_overlap: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+        def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, idx_overlap):
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
@@ -787,6 +1054,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
                 do_finalize=do_finalize,
+                idx_overlap=idx_overlap,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -815,7 +1083,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
-                                 do_finalize=do_finalize)
+                                 do_finalize=do_finalize,
+                                 idx_overlap=idx_overlap)
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -859,7 +1128,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -1056,6 +1325,10 @@ class DeepseekV3Model(DecoderModel):
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
         }
+        self.event_dict = {
+            EventType.Main: torch.cuda.Event(),
+            EventType.MoeChunkingOverlap: torch.cuda.Event(),
+        }
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -1074,28 +1347,60 @@ class DeepseekV3Model(DecoderModel):
 
     def forward(
         self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.IntTensor] = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attn_metadata: Union[AttentionMetadata, Tuple[AttentionMetadata, AttentionMetadata]],
+        input_ids: Optional[Union[torch.IntTensor, Tuple[torch.IntTensor, torch.IntTensor]]] = None,
+        position_ids: Optional[Union[torch.IntTensor, Tuple[torch.IntTensor, torch.IntTensor]]] = None,
+        inputs_embeds: Optional[Union[torch.FloatTensor, Tuple[torch.FloatTensor, torch.FloatTensor]]] = None,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        if not isinstance(attn_metadata, tuple):
+            assert input_ids is None or not isinstance(input_ids, tuple)
+            assert position_ids is None or not isinstance(position_ids, tuple)
+            assert inputs_embeds is None or not isinstance(inputs_embeds, tuple)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
 
-        hidden_states = inputs_embeds
-        residual = None
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+            hidden_states = inputs_embeds
+            residual = None
+        else:
+            if input_ids is None:
+                input_ids = (None, None)
+            if position_ids is None:
+                position_ids = (None, None)
+            if inputs_embeds is None:
+                inputs_embeds = (None, None)
+            assert isinstance(input_ids, tuple)
+            assert isinstance(position_ids, tuple)
+            assert isinstance(inputs_embeds, tuple)
+            assert len(attn_metadata) == len(input_ids) == len(position_ids) == len(inputs_embeds) == 2
+
+            if inputs_embeds[0] is None:
+                assert inputs_embeds[1] is None
+                assert input_ids[0] is not None
+                assert input_ids[1] is not None
+                inputs_embeds = (self.embed_tokens(input_ids[0]), self.embed_tokens(input_ids[1]))
+            else:
+                assert inputs_embeds[1] is not None
+                assert input_ids[0] is None
+                assert input_ids[1] is None
+
+            hidden_states = inputs_embeds
+            residual = (None, None)
+
+        for idx_layer, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                idx_layer=idx_layer,
+                num_layers=self.num_hidden_layers,
+                event_dict=self.event_dict,
             )
 
         return hidden_states
@@ -1175,15 +1480,38 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[MTPSpecMetadata] = None,
         return_context_logits: bool = False,
+        input_ids_overlap_0: Optional[torch.IntTensor] = None,
+        input_ids_overlap_1: Optional[torch.IntTensor] = None,
+        position_ids_overlap_0: Optional[torch.IntTensor] = None,
+        position_ids_overlap_1: Optional[torch.IntTensor] = None,
+        attn_metadata_overlap_0: AttentionMetadata = None,
+        attn_metadata_overlap_1: AttentionMetadata = None,
         **kwargs,
     ) -> torch.Tensor:
+        assert inputs_embeds is None
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
+        if input_ids_overlap_0 is not None:
+            assert input_ids_overlap_1 is not None
+            assert position_ids_overlap_0 is not None
+            assert position_ids_overlap_1 is not None
+            assert attn_metadata_overlap_0 is not None
+            assert attn_metadata_overlap_1 is not None
+            attn_metadata_overlap_0.num_generations_per_batch = self.model_nextn + 1
+            attn_metadata_overlap_1.num_generations_per_batch = self.model_nextn + 1
+            hidden_states = self.model(
+                input_ids=(input_ids_overlap_0, input_ids_overlap_1),
+                attn_metadata=(attn_metadata_overlap_0, attn_metadata_overlap_1),
+                position_ids=(position_ids_overlap_0, position_ids_overlap_1),
+                inputs_embeds=(None, None),
+            )
+            hidden_states = torch.cat(hidden_states, dim=0)
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits

@@ -125,7 +125,6 @@ class Qwen3MoE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
@@ -145,7 +144,6 @@ class Qwen3MoE(nn.Module):
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
         )
 

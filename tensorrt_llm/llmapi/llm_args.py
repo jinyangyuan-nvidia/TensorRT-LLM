@@ -172,6 +172,12 @@ class MoeConfig(StrictBaseModel):
                      "TRITON"] = Field(default='CUTLASS',
                                        description="MoE backend to use.")
 
+    enable_overlap: bool = Field(
+        default=False,
+        description=
+        "If true, the computation and communication will overlap when possible."
+    )
+
     max_num_tokens: Optional[int] = Field(
         default=None,
         description=
@@ -2321,6 +2327,7 @@ class TorchLlmArgs(BaseLlmArgs):
             if self.cuda_graph_config else
             CudaGraphConfig.model_fields['enable_padding'].default,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_enable_overlap=self.moe_config.enable_overlap,
             moe_max_num_tokens=self.moe_config.max_num_tokens,
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,

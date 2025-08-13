@@ -68,8 +68,7 @@ class MixtralMoE(nn.Module):
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+            all_rank_max_num_tokens=all_rank_max_num_tokens)
         return final_hidden_states
 
 

@@ -90,8 +90,7 @@ class QwenMoE(nn.Module):
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+            all_rank_max_num_tokens=all_rank_max_num_tokens)
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = F.sigmoid(

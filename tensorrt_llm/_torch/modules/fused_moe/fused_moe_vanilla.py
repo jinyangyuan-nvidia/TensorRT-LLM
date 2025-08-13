@@ -81,14 +81,6 @@ class VanillaMoE(nn.ModuleList):
             self.num_experts)
         self.expert_size_per_partition = self.expert_end - self.expert_start
 
-        max_num_tokens = model_config.max_num_tokens
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = (model_config.moe_max_num_tokens
-                                   if model_config.moe_max_num_tokens
-                                   is not None else max_num_tokens)
-
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -453,18 +445,17 @@ class VanillaMoE(nn.ModuleList):
         self,
         inputs,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
     ):
-        outputs = inputs
         if self.parallel_size > 1:
             if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
+                outputs = reducescatter(inputs,
+                                        self.mapping,
+                                        dim=0,
+                                        sizes=all_rank_num_tokens)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
+        else:
+            outputs = inputs
         return outputs
 
     def run_experts(
@@ -497,7 +488,6 @@ class VanillaMoE(nn.ModuleList):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert x.shape[-1] == self.hidden_size
@@ -511,7 +501,7 @@ class VanillaMoE(nn.ModuleList):
                 [x, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=all_rank_num_tokens)
 
         expert_masks = ((token_selected_experts >= self.expert_start)
                         & (token_selected_experts < self.expert_end))
@@ -536,6 +526,5 @@ class VanillaMoE(nn.ModuleList):
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
         )
         return final_hidden_states

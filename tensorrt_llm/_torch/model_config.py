@@ -78,6 +78,7 @@ class ModelConfig(Generic[TConfig]):
     max_num_tokens: int = 8192
     max_seq_len: Optional[int] = None
 
+    moe_enable_overlap: bool = False
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 

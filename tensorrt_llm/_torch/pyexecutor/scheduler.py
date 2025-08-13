@@ -17,10 +17,15 @@ SchedulerOutput = namedtuple("SchedulerOutput", [
 
 class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
-    def __init__(self):
-        self.context_requests: RequestList = []
-        self.generation_requests: RequestList = []
-        self.paused_requests: RequestList = []
+    def __init__(
+        self,
+        context_requests: RequestList = [],
+        generation_requests: RequestList = [],
+        paused_requests: RequestList = [],
+    ):
+        self.context_requests: RequestList = context_requests
+        self.generation_requests: RequestList = generation_requests
+        self.paused_requests: RequestList = paused_requests
 
     @property
     def is_generation_only(self) -> bool:

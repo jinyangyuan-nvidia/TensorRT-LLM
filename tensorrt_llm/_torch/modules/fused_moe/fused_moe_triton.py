@@ -1293,19 +1293,14 @@ class TritonFusedMoE(MoE):
         router_logits: torch.Tensor,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "TritonFusedMoE does not support do_finalize=False"
-        assert use_dp_padding is None or not use_dp_padding, \
-            "TritonFusedMoE does not support use_dp_padding=True"
 
         hidden_states = self.quant_method.apply(self, x, router_logits)
 
         final_hidden_states = self.reducescatter_or_allreduce(
-            hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding)
+            hidden_states, all_rank_num_tokens=all_rank_num_tokens)
 
         return final_hidden_states
 

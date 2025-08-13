@@ -280,8 +280,7 @@ class MLPBlock(torch.nn.Module):
             x=t,
             router_logits=g,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+            all_rank_max_num_tokens=all_rank_max_num_tokens)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
