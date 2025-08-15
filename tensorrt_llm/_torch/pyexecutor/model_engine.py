@@ -1654,6 +1654,8 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
+                all_rank_ctx_tokens = self.dist.tp_allgather(
+                    attn_metadata.num_ctx_tokens)
                 attn_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -1662,12 +1664,16 @@ class PyTorchModelEngine(ModelEngine):
                 ]
                 all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
                 attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                attn_metadata.all_rank_ctx_tokens = all_rank_ctx_tokens
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
                 all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
+                all_rank_ctx_tokens = self.dist.tp_allgather(
+                    attn_metadata.num_ctx_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+                attn_metadata.all_rank_ctx_tokens = all_rank_ctx_tokens
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)

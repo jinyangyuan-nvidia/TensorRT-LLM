@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -16,7 +17,7 @@ from ..attention_backend.interface import (AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduce, AllReduceParams, allgather, reducescatter
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -515,9 +516,10 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
     idx_overlap: Optional[int] = None,
+    use_comm: bool = False,
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla", idx_overlap)
-    mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
+    mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output, use_comm=use_comm)
 
 
 def fp8_block_scaling_bmm_out(
@@ -663,11 +665,25 @@ class MLA(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.tp_size_gemm = 2
+        self.mapping_comm = Mapping(
+            world_size=config.mapping.tp_size * pp_size,
+            tp_size=self.tp_size_gemm,
+            pp_size=config.mapping.tp_size * pp_size // self.tp_size_gemm,
+            rank=config.mapping.rank,
+            gpus_per_node=config.mapping.gpus_per_node,
+            enable_attention_dp=False,
+        )
+        self.tp_rank = config.mapping.rank
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
+        assert self.num_heads % self.tp_size_gemm == 0
+        self.num_heads_gemm = self.num_heads // self.tp_size_gemm
+        self.num_key_value_heads_gemm = (num_key_value_heads + self.tp_size_gemm -
+                                         1) // self.tp_size_gemm
 
         rms_norm_eps = config.pretrained_config.rms_norm_eps
         quant_config = config.get_quant_config()
@@ -690,10 +706,10 @@ class MLA(nn.Module):
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads * self.qk_head_dim,
+                self.tp_size_gemm * self.num_heads_gemm * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
-                mapping=mapping,
+                mapping=self.mapping_comm,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -715,7 +731,7 @@ class MLA(nn.Module):
                 tp_size * self.num_heads * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
-                mapping=mapping,
+                mapping=self.mapping_comm,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -729,11 +745,11 @@ class MLA(nn.Module):
 
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
-            tp_size * self.num_heads *
+            self.tp_size_gemm * self.num_heads_gemm *
             (self.qk_nope_head_dim + self.v_head_dim),
             bias=bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=self.mapping_comm,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -744,18 +760,18 @@ class MLA(nn.Module):
         # Used in forward_generation only
         self.v_b_proj = nn.Parameter(
             torch.empty(
-                (self.num_heads, self.v_head_dim, self.kv_lora_rank),
+                (self.num_heads_gemm, self.v_head_dim, self.kv_lora_rank),
                 dtype=dtype,
             ),
             requires_grad=False,
         )
 
         self.o_proj = Linear(
-            self.num_key_value_heads * self.v_head_dim * tp_size,
+            self.num_key_value_heads_gemm * self.v_head_dim * self.tp_size_gemm,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=self.mapping_comm,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -771,6 +787,9 @@ class MLA(nn.Module):
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
+
+        self.all_reduce = AllReduce(mapping=self.mapping_comm,
+                                    strategy=AllReduceStrategy.NCCL)
 
         self.mha = create_attention(
             config.attn_backend,
@@ -842,7 +861,7 @@ class MLA(nn.Module):
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
-                (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
+                (self.num_heads_gemm, self.kv_lora_rank, self.qk_nope_head_dim),
                 dtype=mla_weight_dtype,
             ),
             requires_grad=False,
@@ -854,7 +873,7 @@ class MLA(nn.Module):
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads,
+                        self.num_heads_gemm,
                         self.kv_lora_rank // 128,
                         self.qk_nope_head_dim // 128,
                     ),
@@ -867,7 +886,7 @@ class MLA(nn.Module):
             self.v_b_proj_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads,
+                        self.num_heads_gemm,
                         self.v_head_dim // 128,
                         self.kv_lora_rank // 128,
                     ),
@@ -920,7 +939,8 @@ class MLA(nn.Module):
                      position_ids: Optional[torch.Tensor],
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
-                     output: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     output: Optional[torch.Tensor] = None,
+                     use_comm: bool = False) -> torch.Tensor:
         """
         Forward pass for the MLA module.
 
@@ -952,6 +972,15 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_num_tokens = [
+            val for idx, val in enumerate(all_rank_num_tokens)
+            if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+        ]
+        if use_comm:
+            q = allgather(q, self.mapping_comm, dim=0, sizes=all_rank_num_tokens)
+        else:
+            q = torch.repeat_interleave(q, self.tp_size_gemm, dim=0)
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -959,6 +988,12 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+        if use_comm:
+            q = allgather(q, self.mapping_comm, dim=-1)
+            q = q.split(all_rank_num_tokens, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
+        else:
+            q = torch.repeat_interleave(q, self.tp_size_gemm, dim=-1)
+            q = q.chunk(self.tp_size_gemm, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
 
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -984,7 +1019,8 @@ class MLA(nn.Module):
                 k_pe_ctx,
                 attn_metadata,
                 latent_cache_ctx,
-                output=output if num_generations == 0 else None)
+                output=output if num_generations == 0 else None,
+                use_comm=use_comm)
             if num_generations == 0:
                 return attn_output_context
         else:
@@ -1005,7 +1041,8 @@ class MLA(nn.Module):
                 k_pe_gen,
                 attn_metadata,
                 latent_cache_gen,
-                output=output if num_contexts == 0 else None)
+                output=output if num_contexts == 0 else None,
+                use_comm=use_comm)
             if num_contexts == 0:
                 return attn_output_gen
         else:
@@ -1046,8 +1083,24 @@ class MLA(nn.Module):
             k_pe: torch.Tensor,
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
-            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+            output: Optional[torch.Tensor] = None,
+            use_comm: bool = False) -> torch.Tensor:
+        all_rank_ctx_tokens = attn_metadata.all_rank_ctx_tokens
+        all_rank_ctx_tokens = [
+            val for idx, val in enumerate(all_rank_ctx_tokens)
+            if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+        ]
+        if use_comm:
+            compressed_kv = allgather(compressed_kv, self.mapping_comm, dim=0, sizes=all_rank_ctx_tokens)
+        else:
+            compressed_kv = torch.repeat_interleave(compressed_kv, self.tp_size_gemm, dim=0)
         kv = self.kv_b_proj(compressed_kv)
+        if use_comm:
+            kv = allgather(kv, self.mapping_comm, dim=-1)
+            kv = kv.split(all_rank_ctx_tokens, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
+        else:
+            kv = torch.repeat_interleave(kv, self.tp_size_gemm, dim=-1)
+            kv = kv.chunk(self.tp_size_gemm, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
         k_nope, v = kv.split(
             [
                 self.num_heads * self.qk_nope_head_dim,
@@ -1078,8 +1131,13 @@ class MLA(nn.Module):
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
             out_scale=out_scale,
-            output=output,
+            output=None,
         )
+        attn_output = attn_output.chunk(self.tp_size_gemm, dim=-1)[self.tp_rank % self.tp_size_gemm].contiguous()
+        if output is not None:
+            output[...] = attn_output
+        else:
+            output = attn_output
 
         return attn_output
 
@@ -1089,6 +1147,7 @@ class MLA(nn.Module):
         latent_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        use_comm: bool = False,
     ) -> torch.Tensor:
         assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -1110,7 +1169,22 @@ class MLA(nn.Module):
         assert full_k_pe.is_contiguous()
 
         # compute full_k_nope and full_v from full_compressed_kv
+        all_rank_ctx_tokens = attn_metadata.all_rank_ctx_tokens
+        all_rank_ctx_tokens = [
+            val for idx, val in enumerate(all_rank_ctx_tokens)
+            if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+        ]
+        if use_comm:
+            full_compressed_kv = allgather(full_compressed_kv, self.mapping_comm, dim=0, sizes=all_rank_ctx_tokens)
+        else:
+            full_compressed_kv = torch.repeat_interleave(full_compressed_kv, self.tp_size_gemm, dim=0)
         full_kv = self.kv_b_proj(full_compressed_kv)
+        if use_comm:
+            full_kv = allgather(full_kv, self.mapping_comm, dim=-1)
+            full_kv = full_kv.split(all_rank_ctx_tokens, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
+        else:
+            full_kv = torch.repeat_interleave(full_kv, self.tp_size_gemm, dim=-1)
+            full_kv = full_kv.chunk(self.tp_size_gemm, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
         full_k_nope, full_v = full_kv.split(
             [
                 self.num_heads * self.qk_nope_head_dim,
@@ -1162,8 +1236,13 @@ class MLA(nn.Module):
             mla_context_paged_kv=paged_full_kv,
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
-            output=output,
+            output=None,
         )
+        attn_output = attn_output.chunk(self.tp_size_gemm, dim=-1)[self.tp_rank % self.tp_size_gemm].contiguous()
+        if output is not None:
+            output[...] = attn_output
+        else:
+            output = attn_output
 
         return attn_output
 
@@ -1335,6 +1414,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        use_comm: bool = False,
     ) -> torch.Tensor:
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
@@ -1345,9 +1425,9 @@ class MLA(nn.Module):
                     q, compressed_kv, latent_cache, attn_metadata, output)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
-                    q, latent_cache, attn_metadata, output)
+                    q, latent_cache, attn_metadata, output, use_comm)
         return self.forward_context_default(q, compressed_kv, k_pe,
-                                            attn_metadata, latent_cache, output)
+                                            attn_metadata, latent_cache, output, use_comm)
 
     def forward_generation(
             self,
@@ -1356,7 +1436,8 @@ class MLA(nn.Module):
             k_pe: torch.Tensor,
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
-            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+            output: Optional[torch.Tensor] = None,
+            use_comm: bool = False) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1372,11 +1453,28 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        all_rank_gen_tokens = [val_1 - val_2 for val_1, val_2 in zip(attn_metadata.all_rank_num_tokens, attn_metadata.all_rank_ctx_tokens)]
+        all_rank_gen_tokens = [
+            val for idx, val in enumerate(all_rank_gen_tokens)
+            if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+        ]
         if self.k_b_proj_trans.dtype == torch.bfloat16:
+            if use_comm:
+                q_nope_all = allgather(q_nope, self.mapping_comm, dim=0, sizes=all_rank_gen_tokens)
+            else:
+                q_nope_all = torch.repeat_interleave(q_nope, self.tp_size_gemm, dim=0)
+            q_nope_sel = q_nope_all.chunk(self.tp_size_gemm, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous()
             # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope_t = q_nope.transpose(0, 1)
+            q_nope_t = q_nope_sel.transpose(0, 1)
             # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+            q_nope_out = torch.empty(
+                [
+                    self.num_heads_gemm, num_tokens * self.tp_size_gemm if not use_comm else sum(all_rank_gen_tokens),
+                    self.kv_lora_rank
+                ],
+                dtype=q.dtype,
+                device=q.device,
+            )
 
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
@@ -1384,17 +1482,43 @@ class MLA(nn.Module):
             torch.ops.trtllm.bmm_out(q_nope_t,
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
+            if use_comm:
+                q_nope_out = allgather(q_nope_out, self.mapping_comm, dim=0)
+                q_nope_out = q_nope_out.split(all_rank_gen_tokens, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous().transpose(0, 1)
+            else:
+                q_nope_out = torch.repeat_interleave(q_nope_out, self.tp_size_gemm, dim=0)
+                q_nope_out = q_nope_out.chunk(self.tp_size_gemm, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous().transpose(0, 1)
+            fused_q[..., :self.kv_lora_rank] = q_nope_out
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+            if use_comm:
+                q_nope_all = allgather(q_nope, self.mapping_comm, dim=0, sizes=all_rank_gen_tokens)
+            else:
+                q_nope_all = torch.repeat_interleave(q_nope, self.tp_size_gemm, dim=0)
+            q_nope_sel = q_nope_all.chunk(self.tp_size_gemm, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous()
             # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+            q_nope_out = torch.empty(
+                [
+                    self.num_heads_gemm, num_tokens * self.tp_size_gemm if not use_comm else sum(all_rank_gen_tokens),
+                    self.kv_lora_rank
+                ],
+                dtype=q.dtype,
+                device=q.device,
+            )
 
             fp8_block_scaling_bmm_out(
-                q_nope,
+                q_nope_sel,
                 self.k_b_proj_trans,
                 self.k_b_proj_trans_scale,
                 q_nope_out,
                 self.k_b_proj_trans_dequant,
             )
+            if use_comm:
+                q_nope_out = allgather(q_nope_out, self.mapping_comm, dim=0)
+                q_nope_out = q_nope_out.split(all_rank_gen_tokens, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous().transpose(0, 1)
+            else:
+                q_nope_out = torch.repeat_interleave(q_nope_out, self.tp_size_gemm, dim=0)
+                q_nope_out = q_nope_out.chunk(self.tp_size_gemm, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous().transpose(0, 1)
+            fused_q[..., :self.kv_lora_rank] = q_nope_out
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -1427,14 +1551,17 @@ class MLA(nn.Module):
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads, self.kv_lora_rank])
+        if use_comm:
+            attn_out_latent = allgather(attn_out_latent, self.mapping_comm, dim=0, sizes=all_rank_gen_tokens)
+        else:
+            attn_out_latent = torch.repeat_interleave(attn_out_latent, self.tp_size_gemm, dim=0)
+        attn_out_latent = attn_out_latent.chunk(self.tp_size_gemm, dim=1)[self.tp_rank % self.tp_size_gemm].contiguous()
 
         # [seq, num_heads * v_head_dim]
-        output = output if output is not None else torch.empty(
-            [num_tokens, self.num_heads * self.v_head_dim],
+        attn_output = torch.empty(
+            [num_tokens * self.tp_size_gemm if not use_comm else sum(all_rank_gen_tokens), self.num_heads_gemm, self.v_head_dim],
             dtype=attn_out_latent.dtype,
             device=attn_out_latent.device)
-
-        attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
@@ -1453,6 +1580,16 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+        if use_comm:
+            attn_output = self.all_reduce(attn_output)
+            attn_output = attn_output.split(all_rank_gen_tokens, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
+        else:
+            attn_output = attn_output.chunk(self.tp_size_gemm, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
+        
+        if output is not None:
+            output[...] = attn_output.view(output.shape)
+        else:
+            output = attn_output.flatten(start_dim=1)
 
         return output
 
@@ -1463,18 +1600,45 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         idx_overlap: Optional[int] = None,
+        is_mtp: bool = False,
     ) -> torch.Tensor:
+        if is_mtp:
+            all_rank_num_tokens = None
+            use_comm = False
+        else:
+            all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+            all_rank_ctx_tokens = attn_metadata.all_rank_ctx_tokens
+            all_rank_num_tokens = [
+                val for idx, val in enumerate(all_rank_num_tokens)
+                if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+            ]
+            all_rank_ctx_tokens = [
+                val for idx, val in enumerate(all_rank_ctx_tokens)
+                if idx // self.tp_size_gemm == self.tp_rank // self.tp_size_gemm
+            ]
+            use_comm = all(
+                [val == all_rank_num_tokens[0] for val in all_rank_num_tokens] + \
+                [val == 0 for val in all_rank_ctx_tokens])
 
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
-                                                   attn_output, idx_overlap)
+                                                   attn_output, idx_overlap, use_comm)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
-                              output=attn_output)
+                              output=attn_output,
+                              use_comm=use_comm)
+        if use_comm:
+            attn_output = allgather(attn_output, self.mapping_comm, dim=0, sizes=all_rank_num_tokens)
+        else:
+            attn_output = torch.repeat_interleave(attn_output, self.tp_size_gemm, dim=0)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if use_comm:
+            attn_output = reducescatter(attn_output, self.mapping_comm, dim=0, sizes=all_rank_num_tokens)
+        else:
+            attn_output = attn_output.chunk(self.tp_size_gemm, dim=0)[self.tp_rank % self.tp_size_gemm].contiguous()
         return attn_output

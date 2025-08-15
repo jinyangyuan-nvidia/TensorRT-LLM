@@ -1267,6 +1267,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            is_mtp=True,
             **kwargs,
         )
 
@@ -1571,6 +1572,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
             local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
 
+            tp_size_gemm = 2
+            tp_rank_gemm = tp_rank % tp_size_gemm
+
             kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
                 0,
                 [
@@ -1579,21 +1583,25 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 ],
             )
 
-            if not self.model_config.mapping.enable_attention_dp:
-                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            # if not self.model_config.mapping.enable_attention_dp:
+            if True:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size_gemm, tp_rank_gemm, 0)
             k_nope_weight, v_weight = kv_b_proj.split(
                 [local_qk_nope_head_dim, local_v_head_dim],
                 dim=1,
             )
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            # weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            weight_divisor = tp_size
+            weight_divisor_gemm = tp_size_gemm
             local_num_heads = num_heads // weight_divisor
+            local_num_heads_gemm = num_heads // weight_divisor_gemm
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
-                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                k_nope_weight.reshape(local_num_heads_gemm * local_qk_nope_head_dim,
                                       local_kv_lora_rank),
-                v_weight.reshape(local_num_heads * local_v_head_dim,
+                v_weight.reshape(local_num_heads_gemm * local_v_head_dim,
                                  local_kv_lora_rank)
             ],
                                      dim=0)
@@ -1607,6 +1615,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             local_v_head_dim = v_head_dim
             local_kv_lora_rank = kv_lora_rank
 
+            tp_size_gemm = 2
+            tp_rank_gemm = tp_rank % tp_size_gemm
+
             kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
 
             weight_name = "weight_scale_inv"
@@ -1616,25 +1627,29 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             kv_b_proj = kv_b_proj.unflatten(
                 0,
                 [
-                    num_heads,
+                    num_heads_gemm,
                     local_qk_nope_head_dim + local_v_head_dim,
                 ],
             )
-            if not self.model_config.mapping.enable_attention_dp:
-                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            # if not self.model_config.mapping.enable_attention_dp:
+            if True:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size_gemm, tp_rank_gemm, 0)
             k_nope_weight, v_weight = kv_b_proj.split(
                 [local_qk_nope_head_dim, local_v_head_dim],
                 dim=1,
             )
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            # weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            weight_divisor = tp_size
+            weight_divisor_gemm = tp_size_gemm
             local_num_heads = num_heads // weight_divisor
+            local_num_heads_gemm = num_heads // weight_divisor_gemm
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
-                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                k_nope_weight.reshape(local_num_heads_gemm * local_qk_nope_head_dim,
                                       local_kv_lora_rank),
-                v_weight.reshape(local_num_heads * local_v_head_dim,
+                v_weight.reshape(local_num_heads_gemm * local_v_head_dim,
                                  local_kv_lora_rank)
             ],
                                      dim=0)
@@ -1646,17 +1661,22 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
 
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            tp_size_gemm = 2
+
+            # weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            weight_divisor = tp_size
+            weight_divisor_gemm = tp_size_gemm
             local_num_heads = num_heads // weight_divisor
+            local_num_heads_gemm = num_heads // weight_divisor_gemm
 
             k_b_proj, v_b_proj = kv_b_proj.split([
-                local_num_heads * local_qk_nope_head_dim,
-                local_num_heads * local_v_head_dim
+                local_num_heads_gemm * local_qk_nope_head_dim,
+                local_num_heads_gemm * local_v_head_dim
             ],
                                                  dim=0)
             k_b_proj = k_b_proj.view(
-                [local_num_heads, local_qk_nope_head_dim, -1])
-            v_b_proj = v_b_proj.view([local_num_heads, local_v_head_dim, -1])
+                [local_num_heads_gemm, local_qk_nope_head_dim, -1])
+            v_b_proj = v_b_proj.view([local_num_heads_gemm, local_v_head_dim, -1])
 
             return k_b_proj, v_b_proj
 
