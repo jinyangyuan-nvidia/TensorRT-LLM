@@ -1575,7 +1575,7 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
     constexpr uint32_t num_problems = 1;
 
     uint32_t m_threshold = 32;
-    if (shape_m >= m_threshold)
+    if (shape_m > m_threshold)
     {
         // Select the best configuration based on shape dimensions
         auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size]

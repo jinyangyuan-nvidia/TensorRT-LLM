@@ -13,8 +13,11 @@ from tensorrt_llm.quantization.utils import fp4_utils
 is_torch_compiling_flag = False
 
 aux_stream_name_list = [
+    'MainTBO',
     'Attention',
+    'AttentionTBO',
     'MoeShared',
+    'MoeSharedTBO',
     'MoeChunkingOverlap',
     'MoeBalancer',
 ]

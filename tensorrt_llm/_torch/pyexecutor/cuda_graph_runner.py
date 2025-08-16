@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 
 from ..attention_backend.interface import AttentionMetadata
+from ..metadata import KVCacheParams
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
 
@@ -35,6 +36,8 @@ class DecodingCUDAGraphRunner:
         spec_metadata: Optional[SpecMetadata] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        attn_metadata_overlap_0: Optional[AttentionMetadata] = None,
+        attn_metadata_overlap_1: Optional[AttentionMetadata] = None,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -74,6 +77,36 @@ class DecodingCUDAGraphRunner:
         self._output = None
         self._graph = None
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
+        if batch_size > 1 and attn_metadata_overlap_0 is not None:
+            assert attn_metadata_overlap_1 is not None
+            offset_split = (batch_size + 1) // 2
+            self.input_ids_overlap_0 = torch.ones(
+                (offset_split * max_beam_width * token_per_request, ),
+                device=device,
+                dtype=torch.int32)
+            self.input_ids_overlap_1 = torch.ones(
+                ((batch_size - offset_split) * max_beam_width *
+                 token_per_request, ),
+                device=device,
+                dtype=torch.int32)
+            self.position_ids_overlap_0 = torch.zeros(
+                (1, offset_split * max_beam_width * token_per_request),
+                device=device,
+                dtype=torch.int32)
+            self.position_ids_overlap_1 = torch.zeros(
+                (1, (batch_size - offset_split) * max_beam_width *
+                 token_per_request),
+                device=device,
+                dtype=torch.int32)
+            self.attn_metadata_overlap_0 = attn_metadata_overlap_0
+            self.attn_metadata_overlap_1 = attn_metadata_overlap_1
+        else:
+            self.input_ids_overlap_0 = None
+            self.input_ids_overlap_1 = None
+            self.position_ids_overlap_0 = None
+            self.position_ids_overlap_1 = None
+            self.attn_metadata_overlap_0 = None
+            self.attn_metadata_overlap_1 = None
 
     def __del__(self):
         self._graph.reset()
@@ -92,6 +125,22 @@ class DecodingCUDAGraphRunner:
             "spec_metadata": self.spec_metadata,
             "mrope_position_deltas": self.mrope_position_deltas,
         }
+        if self.batch_size > 1 and self.attn_metadata_overlap_0 is not None:
+            assert self.attn_metadata_overlap_1 is not None
+            inputs.update({
+                "input_ids_overlap_0":
+                self.input_ids_overlap_0,
+                "input_ids_overlap_1":
+                self.input_ids_overlap_1,
+                "position_ids_overlap_0":
+                self.position_ids_overlap_0,
+                "position_ids_overlap_1":
+                self.position_ids_overlap_1,
+                "attn_metadata_overlap_0":
+                self.attn_metadata_overlap_0,
+                "attn_metadata_overlap_1":
+                self.attn_metadata_overlap_1,
+            })
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
@@ -112,7 +161,7 @@ class DecodingCUDAGraphRunner:
     def needs_capture(self) -> bool:
         return self._output is None
 
-    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
+    def run(self, inputs: Dict[str, Any], is_capture=False) -> torch.Tensor:
         assert "input_ids" in inputs
         assert "position_ids" in inputs
         assert "attn_metadata" in inputs
@@ -133,6 +182,94 @@ class DecodingCUDAGraphRunner:
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
+        if "attn_metadata_overlap_0" in inputs and self.attn_metadata_overlap_0 is not None:
+            assert inputs[
+                "attn_metadata_overlap_0"] is self.attn_metadata_overlap_0, (
+                    "attn_metadata_overlap_0 does not match the attn_metadata_overlap_0 instance that was used to "
+                    "capture this graph.")
+            assert inputs[
+                "attn_metadata_overlap_1"] is self.attn_metadata_overlap_1, (
+                    "attn_metadata_overlap_1 does not match the attn_metadata_overlap_1 instance that was used to "
+                    "capture this graph.")
+
+            if not is_capture:
+                assert len(attn_metadata.request_ids) == len(
+                    attn_metadata.prompt_lens)
+                assert input_ids.shape[0] == position_ids.shape[1]
+                split_request = (len(attn_metadata.request_ids) + 1) // 2
+                split_context = (attn_metadata.num_contexts + 1) // 2
+                assert len(attn_metadata.kv_cache_params.
+                           num_cached_tokens_per_seq) % len(
+                               attn_metadata.request_ids) == 0
+                unit_cached_tokens = len(attn_metadata.kv_cache_params.
+                                         num_cached_tokens_per_seq) // len(
+                                             attn_metadata.request_ids)
+                split_cached_tokens = split_request * unit_cached_tokens
+                assert input_ids.shape[0] % len(attn_metadata.request_ids) == 0
+                unit_input = input_ids.shape[0] // len(
+                    attn_metadata.request_ids)
+                split_input = split_request * unit_input
+                self.attn_metadata_overlap_0.beam_width = attn_metadata.beam_width
+                self.attn_metadata_overlap_1.beam_width = attn_metadata.beam_width
+                self.attn_metadata_overlap_0.request_ids = attn_metadata.request_ids[:
+                                                                                     split_request]
+                self.attn_metadata_overlap_1.request_ids = attn_metadata.request_ids[
+                    split_request:]
+                self.attn_metadata_overlap_0.prompt_lens = attn_metadata.prompt_lens[:
+                                                                                     split_request]
+                self.attn_metadata_overlap_1.prompt_lens = attn_metadata.prompt_lens[
+                    split_request:]
+                self.attn_metadata_overlap_0.num_contexts = split_context
+                self.attn_metadata_overlap_1.num_contexts = attn_metadata.num_contexts - split_context
+                self.attn_metadata_overlap_0.kv_cache_params = KVCacheParams(
+                    use_cache=attn_metadata.kv_cache_params.use_cache,
+                    block_ids_per_seq=attn_metadata.kv_cache_params.
+                    block_ids_per_seq,
+                    num_cached_tokens_per_seq=attn_metadata.kv_cache_params.
+                    num_cached_tokens_per_seq[:split_cached_tokens])
+                self.attn_metadata_overlap_1.kv_cache_params = KVCacheParams(
+                    use_cache=attn_metadata.kv_cache_params.use_cache,
+                    block_ids_per_seq=attn_metadata.kv_cache_params.
+                    block_ids_per_seq,
+                    num_cached_tokens_per_seq=attn_metadata.kv_cache_params.
+                    num_cached_tokens_per_seq[split_cached_tokens:])
+                self.attn_metadata_overlap_0.kv_cache_manager = attn_metadata.kv_cache_manager
+                self.attn_metadata_overlap_1.kv_cache_manager = attn_metadata.kv_cache_manager
+                self.attn_metadata_overlap_0.prepare()
+                self.attn_metadata_overlap_1.prepare()
+                input_ids_overlap_0 = input_ids[:split_input]
+                input_ids_overlap_1 = input_ids[split_input:]
+                position_ids_overlap_0 = position_ids[:, :split_input]
+                position_ids_overlap_1 = position_ids[:, split_input:]
+            else:
+                input_ids_overlap_0 = inputs["input_ids_overlap_0"]
+                input_ids_overlap_1 = inputs["input_ids_overlap_1"]
+                position_ids_overlap_0 = inputs["position_ids_overlap_0"]
+                position_ids_overlap_1 = inputs["position_ids_overlap_1"]
+            seqlen_overlap_0 = input_ids_overlap_0.shape[0]
+            seqlen_overlap_1 = input_ids_overlap_1.shape[0]
+            self.input_ids_overlap_0[:seqlen_overlap_0].copy_(
+                input_ids_overlap_0)
+            self.input_ids_overlap_1[:seqlen_overlap_1].copy_(
+                input_ids_overlap_1)
+            self.position_ids_overlap_0[:, :seqlen_overlap_0].copy_(
+                position_ids_overlap_0)
+            self.position_ids_overlap_1[:, :seqlen_overlap_1].copy_(
+                position_ids_overlap_1)
+            inputs.update({
+                "input_ids_overlap_0":
+                self.input_ids_overlap_0,
+                "input_ids_overlap_1":
+                self.input_ids_overlap_1,
+                "position_ids_overlap_0":
+                self.position_ids_overlap_0,
+                "position_ids_overlap_1":
+                self.position_ids_overlap_1,
+                "attn_metadata_overlap_0":
+                self.attn_metadata_overlap_0,
+                "attn_metadata_overlap_1":
+                self.attn_metadata_overlap_1,
+            })
         if "mrope_position_deltas" in inputs:
             self.mrope_position_deltas[:self.batch_size].copy_(
                 inputs["mrope_position_deltas"])

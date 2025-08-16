@@ -45,6 +45,8 @@ class PyTorchConfig:
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
+    # If true, enable two batch overlap.
+    enable_two_batch_overlap: bool = False
 
     attention_dp_enable_balance: bool = False
     attention_dp_time_out_iters: int = 50

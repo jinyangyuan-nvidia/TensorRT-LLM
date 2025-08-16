@@ -45,6 +45,12 @@
 namespace deep_gemm
 {
 template <typename T>
+__device__ __host__ constexpr T div_up(T a, T b)
+{
+    return (a + b - 1) / b;
+}
+
+template <typename T>
 static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m, uint32_t shape_k, uint32_t block_m,
     uint32_t block_k, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
 {
@@ -181,7 +187,8 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
     // Cluster launch
     cudaLaunchConfig_t config;
-    config.gridDim = num_sms;
+    config.gridDim
+        = std::min(num_sms, static_cast<int>(div_up(shape_m, block_m) * div_up(shape_n, block_n) * num_groups));
     config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
@@ -225,7 +232,8 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
 
     // Cluster launch
     cudaLaunchConfig_t config;
-    config.gridDim = num_sms;
+    config.gridDim
+        = std::min(num_sms, static_cast<int>(div_up(shape_m, block_m) * div_up(shape_n, block_n) * num_groups));
     config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
@@ -266,7 +274,8 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
     // Cluster launch
     cudaLaunchConfig_t config;
-    config.gridDim = num_sms;
+    config.gridDim
+        = std::min(num_sms, static_cast<int>(div_up(max_shape_m_padded, block_m) * div_up(shape_n, block_n)));
     config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
@@ -312,7 +321,8 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
 
     // Cluster launch
     cudaLaunchConfig_t config;
-    config.gridDim = num_sms;
+    config.gridDim
+        = std::min(num_sms, static_cast<int>(div_up(shape_m, block_m) * div_up(max_shape_n_padded, block_n)));
     config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
