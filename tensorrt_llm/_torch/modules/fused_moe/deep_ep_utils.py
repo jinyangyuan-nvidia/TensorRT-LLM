@@ -144,27 +144,25 @@ class VariableLengthLowLatencyBuffer:
 
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         recv_hidden_states, recv_expert_count, handle, event, hook = \
-            self.buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8=False)
+            self.buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8=False, return_recv_hook=True)
         assert event.event is None
-        assert hook is None
 
         # NOTES: the actual tensor will not be received only if you call `hook()`,
         # it is useful for double-batch overlapping, but **without any SM occupation**
         # If you don't want to overlap, please set `return_recv_hook=False`
         # Later, you can use our GEMM library to do the computation with this specific format
-        return recv_hidden_states, recv_expert_count, handle
+        return recv_hidden_states, recv_expert_count, handle, hook
 
     def low_latency_combine(self, hidden_states: torch.Tensor,
                             topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: Tuple):
         # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
         combined_hidden_states, event, hook = \
-            self.buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle)
+            self.buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle, return_recv_hook=True)
         assert event.event is None
-        assert hook is None
 
         # NOTES: the same behavior as described in the dispatch kernel
-        return combined_hidden_states
+        return combined_hidden_states, hook
 
     def low_latency_dispatch_fp4(self, hidden_states: torch.Tensor,
                                  scales: torch.Tensor, topk_idx: torch.Tensor,

@@ -81,6 +81,8 @@ class ModelConfig(Generic[TConfig]):
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
+    enable_two_batch_overlap: bool = False
+
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend

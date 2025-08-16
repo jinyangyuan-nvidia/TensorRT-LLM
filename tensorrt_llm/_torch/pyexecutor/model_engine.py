@@ -311,6 +311,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
             moe_load_balancer=pytorch_backend_config.moe_load_balancer,
+            enable_two_batch_overlap=pytorch_backend_config.enable_two_batch_overlap,
             lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -410,6 +411,8 @@ class PyTorchModelEngine(ModelEngine):
         # NOTE: This can simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
+        self.attn_metadata_overlap_0 = None
+        self.attn_metadata_overlap_1 = None
         self.iter_states = {}
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
@@ -447,13 +450,26 @@ class PyTorchModelEngine(ModelEngine):
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
+            batch_size_split = (self.batch_size + 1) // 2
             self.cache_indirection_attention = torch.zeros(
                 (self.batch_size, self.max_beam_width, self.max_seq_len +
                  (0 if self._disable_overlap_scheduler else 1)),
                 device="cuda",
                 dtype=torch.int32)
+            self.cache_indirection_attention_overlap_0 = torch.zeros(
+                (batch_size_split, self.max_beam_width, self.max_seq_len +
+                 (0 if self._disable_overlap_scheduler else 1)),
+                device="cuda",
+                dtype=torch.int32)
+            self.cache_indirection_attention_overlap_1 = torch.zeros(
+                (self.batch_size - batch_size_split, self.max_beam_width, self.max_seq_len +
+                 (0 if self._disable_overlap_scheduler else 1)),
+                device="cuda",
+                dtype=torch.int32)
         else:
             self.cache_indirection_attention = None
+            self.cache_indirection_attention_overlap_0 = None
+            self.cache_indirection_attention_overlap_1 = None
 
     @property
     def runtime_draft_len(self):
@@ -804,36 +820,63 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
-        if kv_cache_manager is None:
-            return self.attn_backend.Metadata(
+        cache_indirection_overlap_0 = self.cache_indirection_attention_overlap_0 if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        cache_indirection_overlap_1 = self.cache_indirection_attention_overlap_1 if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        
+        def create_attn_metadata():
+            batch_size_split = (self.batch_size + 1) // 2
+            attn_metadata = self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
-                kv_cache_manager=None,
+                kv_cache_manager=kv_cache_manager,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_paged_context_mla=enable_paged_context_mla,
                 cache_indirection=cache_indirection)
+            attn_metadata_overlap_0 = self.attn_backend.Metadata(
+                max_num_requests=batch_size_split,
+                max_num_tokens=self.max_num_tokens,
+                max_num_sequences=batch_size_split * self.max_beam_width,
+                kv_cache_manager=kv_cache_manager,
+                mapping=self.mapping,
+                runtime_features=self.attn_runtime_features,
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla,
+                cache_indirection=cache_indirection_overlap_0)
+            attn_metadata_overlap_1 = self.attn_backend.Metadata(
+                max_num_requests=self.batch_size - batch_size_split,
+                max_num_tokens=self.max_num_tokens,
+                max_num_sequences=(self.batch_size - batch_size_split) * self.max_beam_width,
+                kv_cache_manager=kv_cache_manager,
+                mapping=self.mapping,
+                runtime_features=self.attn_runtime_features,
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla,
+                cache_indirection=cache_indirection_overlap_1)
+            return attn_metadata, attn_metadata_overlap_0, attn_metadata_overlap_1
 
-        if self.attn_metadata is not None:
-            # This assertion can be relaxed if needed: just create a new metadata
-            # object if it changes.
-            assert self.attn_metadata.kv_cache_manager is kv_cache_manager
-            return self.attn_metadata
-
-        self.attn_metadata = self.attn_backend.Metadata(
-            max_num_requests=self.batch_size,
-            max_num_tokens=self.max_num_tokens,
-            max_num_sequences=self.batch_size * self.max_beam_width,
-            kv_cache_manager=kv_cache_manager,
-            mapping=self.mapping,
-            runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla,
-            cache_indirection=cache_indirection)
-
-        return self.attn_metadata
+        if kv_cache_manager is None:
+            attn_metadata, attn_metadata_overlap_0, attn_metadata_overlap_1 = create_attn_metadata()
+        else:
+            if self.attn_metadata is not None:
+                assert self.attn_metadata_overlap_0 is not None
+                assert self.attn_metadata_overlap_1 is not None
+                # This assertion can be relaxed if needed: just create a new metadata
+                # object if it changes.
+                assert self.attn_metadata.kv_cache_manager is kv_cache_manager
+                assert self.attn_metadata_overlap_0.kv_cache_manager is kv_cache_manager
+                assert self.attn_metadata_overlap_1.kv_cache_manager is kv_cache_manager
+                attn_metadata = self.attn_metadata
+                attn_metadata_overlap_0 = self.attn_metadata_overlap_0
+                attn_metadata_overlap_1 = self.attn_metadata_overlap_1
+            else:
+                attn_metadata, attn_metadata_overlap_0, attn_metadata_overlap_1 = create_attn_metadata()
+                self.attn_metadata = attn_metadata
+                self.attn_metadata_overlap_0 = attn_metadata_overlap_0
+                self.attn_metadata_overlap_1 = attn_metadata_overlap_1
+        return attn_metadata, attn_metadata_overlap_0, attn_metadata_overlap_1
 
     def _set_up_spec_metadata(
             self,
@@ -986,9 +1029,21 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
+        num_sequences_in_batch_overlap_0 = (batch_size + 1) // 2 * self.max_beam_width
+        num_sequences_in_batch_overlap_1 = num_sequences_in_batch - num_sequences_in_batch_overlap_0
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
             num_sequences_in_batch, False, draft_len)
         assert attn_metadata.is_cuda_graph
+        if self.pytorch_backend_config.enable_two_batch_overlap:
+            attn_metadata_overlap_0 = self.attn_metadata_overlap_0.create_cuda_graph_metadata(
+                num_sequences_in_batch_overlap_0, False, draft_len)
+            attn_metadata_overlap_1 = self.attn_metadata_overlap_1.create_cuda_graph_metadata(
+                num_sequences_in_batch_overlap_1, False, draft_len)
+            assert attn_metadata_overlap_0.is_cuda_graph
+            assert attn_metadata_overlap_1.is_cuda_graph
+        else:
+            attn_metadata_overlap_0 = None
+            attn_metadata_overlap_1 = None
 
         if self.enable_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
@@ -1003,7 +1058,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
             batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
-            self.max_beam_width)
+            self.max_beam_width, attn_metadata_overlap_0=attn_metadata_overlap_0, attn_metadata_overlap_1=attn_metadata_overlap_1)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -1020,6 +1075,7 @@ class PyTorchModelEngine(ModelEngine):
                     max_num_tokens: int,
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
+                    enable_two_batch_overlap: bool = False,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs) -> DecoderModelForCausalLM:
         config = checkpoint_loader.load_config(
@@ -1034,6 +1090,7 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
+            enable_two_batch_overlap=enable_two_batch_overlap,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
@@ -1197,6 +1254,22 @@ class PyTorchModelEngine(ModelEngine):
                 inputs['attn_metadata'].kv_lens_cuda[
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+                if 'attn_metadata_overlap_0' in inputs:
+                    assert 'attn_metadata_overlap_1' in inputs
+                    num_seq_overlap_0 = inputs['attn_metadata_overlap_0'].num_seqs
+                    num_ctx_requests_overlap_0 = inputs['attn_metadata_overlap_0'].num_contexts
+                    num_gen_requests_overlap_0 = inputs['attn_metadata_overlap_0'].num_generations
+                    num_ctx_tokens_overlap_0 = inputs['attn_metadata_overlap_0'].num_ctx_tokens
+                    num_seq_overlap_1 = inputs['attn_metadata_overlap_1'].num_seqs
+                    num_ctx_requests_overlap_1 = inputs['attn_metadata_overlap_1'].num_contexts
+                    num_gen_requests_overlap_1 = inputs['attn_metadata_overlap_1'].num_generations
+                    num_ctx_tokens_overlap_1 = inputs['attn_metadata_overlap_1'].num_ctx_tokens
+                    inputs['attn_metadata_overlap_0'].kv_lens_cuda[
+                        num_ctx_requests_overlap_0:num_seq_overlap_0] += (
+                            self.previous_kv_lens_offsets_cuda[:num_gen_requests_overlap_0])
+                    inputs['attn_metadata_overlap_1'].kv_lens_cuda[
+                        num_ctx_requests_overlap_1:num_seq_overlap_1] += (
+                            self.previous_kv_lens_offsets_cuda[num_gen_requests_overlap_0:num_gen_requests])
         return inputs
 
     def _prepare_tp_inputs(
@@ -2134,7 +2207,7 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
+        attn_metadata, attn_metadata_overlap_0, attn_metadata_overlap_1 = self._set_up_attn_metadata(kv_cache_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -2143,6 +2216,16 @@ class PyTorchModelEngine(ModelEngine):
                                                        is None)
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             attn_metadata.update_spec_dec_param(
+                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
+                spec_metadata.is_spec_dec_tree,
+                spec_metadata.is_spec_dec_dynamic_tree,
+                spec_metadata.max_draft_len)
+            attn_metadata_overlap_0.update_spec_dec_param(
+                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
+                spec_metadata.is_spec_dec_tree,
+                spec_metadata.is_spec_dec_dynamic_tree,
+                spec_metadata.max_draft_len)
+            attn_metadata_overlap_1.update_spec_dec_param(
                 spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
                 spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
@@ -2172,9 +2255,13 @@ class PyTorchModelEngine(ModelEngine):
             maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
             if maybe_graph is not None:
                 attn_metadata = maybe_graph.attn_metadata
+                attn_metadata_overlap_0 = maybe_graph.attn_metadata_overlap_0
+                attn_metadata_overlap_1 = maybe_graph.attn_metadata_overlap_1
                 spec_metadata = maybe_graph.spec_metadata
             else:
                 attn_metadata = self.attn_metadata
+                attn_metadata_overlap_0 = self.attn_metadata_overlap_0
+                attn_metadata_overlap_1 = self.attn_metadata_overlap_1
                 if self.enable_spec_decode:
                     spec_metadata = self.spec_metadata
                 else:
@@ -2183,6 +2270,11 @@ class PyTorchModelEngine(ModelEngine):
             inputs, gather_ids = self._prepare_inputs(
                 scheduled_requests, kv_cache_manager, attn_metadata,
                 spec_metadata, new_tensors_device, cache_indirection_buffer)
+            enable_two_batch_overlap = self.pytorch_backend_config.enable_two_batch_overlap and maybe_graph is not None and attn_metadata_overlap_0 is not None
+            if enable_two_batch_overlap:
+                assert attn_metadata_overlap_1 is not None
+                inputs["attn_metadata_overlap_0"] = attn_metadata_overlap_0
+                inputs["attn_metadata_overlap_1"] = attn_metadata_overlap_1
 
             self.iter_counter += 1
 
@@ -2192,6 +2284,25 @@ class PyTorchModelEngine(ModelEngine):
                                                  gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
+
+                    if enable_two_batch_overlap:
+                        offset_split = (scheduled_requests.batch_size + 1) // 2
+                        scheduled_requests_overlap_0 = ScheduledRequests(
+                            generation_requests=scheduled_requests.generation_requests[:offset_split],
+                            paused_requests=scheduled_requests.paused_requests,
+                        )
+                        scheduled_requests_overlap_1 = ScheduledRequests(
+                            generation_requests=scheduled_requests.generation_requests[offset_split:],
+                            paused_requests=scheduled_requests.paused_requests,
+                        )
+                        inputs_overlap_0, gather_ids_overlap_0 = self._prepare_inputs(
+                            scheduled_requests_overlap_0, kv_cache_manager, attn_metadata_overlap_0)
+                        inputs_overlap_1, gather_ids_overlap_1 = self._prepare_inputs(
+                            scheduled_requests_overlap_1, kv_cache_manager, attn_metadata_overlap_1)
+                        inputs["input_ids_overlap_0"] = inputs_overlap_0["input_ids"]
+                        inputs["input_ids_overlap_1"] = inputs_overlap_1["input_ids"]
+                        inputs["position_ids_overlap_0"] = inputs_overlap_0["position_ids"]
+                        inputs["position_ids_overlap_1"] = inputs_overlap_1["position_ids"]
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -2208,10 +2319,10 @@ class PyTorchModelEngine(ModelEngine):
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    outputs = maybe_graph.run(inputs)
+                    outputs = maybe_graph.run(inputs, is_capture=True)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = maybe_graph.run(inputs)
+                        outputs = maybe_graph.run(inputs, is_capture=False)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
@@ -2221,6 +2332,10 @@ class PyTorchModelEngine(ModelEngine):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        if 'attn_metadata_overlap_0' in kwargs:
+            assert 'attn_metadata_overlap_1' in kwargs
+            attrs["attention_metadata_overlap_0"] = weakref.ref(kwargs['attn_metadata_overlap_0'])
+            attrs["attention_metadata_overlap_1"] = weakref.ref(kwargs['attn_metadata_overlap_1'])
         attrs.update(self.model.model_config.extra_attrs)
 
         if self._torch_compile_backend is not None:

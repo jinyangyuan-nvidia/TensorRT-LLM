@@ -1193,6 +1193,11 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable attention data parallel.",
         status="beta")
 
+    enable_two_batch_overlap: bool = Field(
+        default=False,
+        description="Enable two batch overlap.",
+        status="prototype")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -2341,6 +2346,7 @@ class TorchLlmArgs(BaseLlmArgs):
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_config.max_num_tokens,
             moe_load_balancer=self.moe_config.load_balancer,
+            enable_two_batch_overlap=self.enable_two_batch_overlap,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,

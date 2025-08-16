@@ -1,6 +1,6 @@
 import math
 import weakref
-from typing import Optional, Union, cast
+from typing import Dict, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -19,7 +19,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
@@ -27,12 +27,19 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-def extract_extra_attrs(layer_idx: str, attn_type: str):
+def extract_extra_attrs(layer_idx: str, attn_type: str, idx_overlap: Optional[int] = None):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs is not set"
 
-    metadata_ref = extra_attrs.get("attention_metadata", None)
+    if idx_overlap is None:
+        metadata_ref = extra_attrs.get("attention_metadata", None)
+    elif idx_overlap == 0:
+        metadata_ref = extra_attrs.get("attention_metadata_overlap_0", None)
+    elif idx_overlap == 1:
+        metadata_ref = extra_attrs.get("attention_metadata_overlap_1", None)
+    else:
+        raise ValueError(f"Invalid index overlap: {idx_overlap}")
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
     if attn_type == "mla":
@@ -507,9 +514,10 @@ def mla_custom_op_inplace(
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
+    idx_overlap: Optional[int] = None,
 ) -> None:
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
+    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla", idx_overlap)
+    mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output, idx_overlap=idx_overlap)
 
 
 def fp8_block_scaling_bmm_out(
@@ -573,7 +581,7 @@ class MLA(nn.Module):
         predicted_tokens_per_seq: int,
         max_position_embeddings: int,
         bias: bool,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -802,8 +810,20 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.aux_stream_dict = {
+            key: aux_stream_dict[key] for key in [
+                AuxStreamType.Attention,
+                AuxStreamType.AttentionTBO,
+            ]
+        }
+        self.event_dict = {
+            key: torch.cuda.Event() for key in [
+                EventType.Main,
+                EventType.MainTBO,
+                EventType.Attention,
+                EventType.AttentionTBO,
+            ]
+        }
 
         self.rope_fusion = self.mha.support_fused_rope()
         self.support_fused_qkv = self.mha.support_fused_qkv()
@@ -912,7 +932,8 @@ class MLA(nn.Module):
                      position_ids: Optional[torch.Tensor],
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
-                     output: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     output: Optional[torch.Tensor] = None,
+                     idx_overlap: Optional[int] = None) -> torch.Tensor:
         """
         Forward pass for the MLA module.
 
@@ -925,6 +946,17 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        if idx_overlap is None or idx_overlap == 0:
+            aux_stream = self.aux_stream_dict[AuxStreamType.Attention]
+            event_0 = self.event_dict[EventType.Main]
+            event_1 = self.event_dict[EventType.Attention]
+        elif idx_overlap == 1:
+            aux_stream = self.aux_stream_dict[AuxStreamType.AttentionTBO]
+            event_0 = self.event_dict[EventType.MainTBO]
+            event_1 = self.event_dict[EventType.AttentionTBO]
+        else:
+            raise ValueError(f"Invalid index overlap: {idx_overlap}")
+
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
@@ -939,17 +971,17 @@ class MLA(nn.Module):
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),
                 lambda: self.kv_a_layernorm(compressed_kv),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
+                event_0,
+                event_1,
+                aux_stream,
             )
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
+            event_0,
+            event_1,
+            aux_stream,
         )
 
         # split q, k, v into context and gen batches
@@ -1448,24 +1480,231 @@ class MLA(nn.Module):
 
         return output
 
+    def run_pre_gemm(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        idx_overlap: Optional[int] = None,
+    ):
+        if self.register_to_config:
+            attn_metadata, _ = extract_extra_attrs(self.layer_idx_str, "mla", idx_overlap)
+        if attn_metadata.num_contexts > 0:
+            mla_params = {
+                "position_ids": position_ids,
+                "hidden_states": hidden_states,
+                "attn_metadata": attn_metadata,
+                "all_reduce_params": all_reduce_params,
+                "idx_overlap": idx_overlap,
+            }
+        else:
+            output = self.create_output(hidden_states)
+            if idx_overlap is None or idx_overlap == 0:
+                aux_stream = self.aux_stream_dict[AuxStreamType.Attention]
+                event_0 = self.event_dict[EventType.Main]
+                event_1 = self.event_dict[EventType.Attention]
+            elif idx_overlap == 1:
+                aux_stream = self.aux_stream_dict[AuxStreamType.AttentionTBO]
+                event_0 = self.event_dict[EventType.MainTBO]
+                event_1 = self.event_dict[EventType.AttentionTBO]
+            else:
+                raise ValueError(f"Invalid index overlap: {idx_overlap}")
+
+            if self.is_lite:
+                compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+                compressed_kv = self.kv_a_layernorm(compressed_kv)
+                q = hidden_states
+            else:
+                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                    hidden_states).split([
+                        self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                    ], -1)
+
+                q, compressed_kv = maybe_execute_in_parallel(
+                    lambda: self.q_a_layernorm(q),
+                    lambda: self.kv_a_layernorm(compressed_kv),
+                    event_0,
+                    event_1,
+                    aux_stream,
+                )
+
+            q, latent_cache = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q),
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                event_0,
+                event_1,
+                aux_stream,
+            )
+
+            # split q, k, v into context and gen batches
+            num_contexts = attn_metadata.num_contexts
+            num_generations = attn_metadata.num_generations
+            num_ctx_tokens = attn_metadata.num_ctx_tokens
+            num_tokens = attn_metadata.num_tokens
+
+            assert q.shape[
+                0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+
+            q = q[num_ctx_tokens:, ...]
+            compressed_kv = compressed_kv[num_ctx_tokens:, ...]
+            k_pe = k_pe[num_ctx_tokens:, ...]
+            latent_cache = latent_cache[num_ctx_tokens:, ...]
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe = self.apply_rope(q, k_pe, position_ids)
+
+            num_tokens = q.shape[0]
+            q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+            # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
+            # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
+            fused_q = torch.empty(
+                [
+                    num_tokens, self.num_heads,
+                    (self.kv_lora_rank + self.qk_rope_head_dim)
+                ],
+                dtype=q.dtype,
+                device=q.device,
+            )
+
+            if self.k_b_proj_trans.dtype == torch.bfloat16:
+                # [num_heads, num_tokens, self.qk_nope_head_dim]
+                q_nope_t = q_nope.transpose(0, 1)
+                # [num_heads, num_tokens, self.kv_lora_rank]
+                q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+                # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
+                # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
+                # The output of bmm is written directly into fused_q
+                torch.ops.trtllm.bmm_out(q_nope_t,
+                                        self.k_b_proj_trans.transpose(1, 2),
+                                        q_nope_out)
+            elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+                # [num_heads, num_tokens, self.kv_lora_rank]
+                q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+                fp8_block_scaling_bmm_out(
+                    q_nope,
+                    self.k_b_proj_trans,
+                    self.k_b_proj_trans_scale,
+                    q_nope_out,
+                    self.k_b_proj_trans_dequant,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+
+            if self.apply_rotary_emb:
+                fused_q[..., self.kv_lora_rank:] = q_pe
+            fused_q = fused_q.view([
+                num_tokens,
+                self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+            ])
+
+            # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+            out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+
+            mla_params = {
+                "fused_q": fused_q,
+                "attn_metadata": attn_metadata,
+                "out_scale": out_scale,
+                "latent_cache": latent_cache,  # kvcache and k_pe
+                "q_pe": q_pe,
+                "q": q,
+                "output": output,
+                "num_tokens": num_tokens,
+                "all_reduce_params": all_reduce_params,
+            }
+        return mla_params
+
+    def run_mla(self, mla_params):
+        if mla_params["attn_metadata"].num_contexts > 0:
+            mla_params["attn_output"] = self.forward(
+                mla_params["position_ids"],
+                mla_params["hidden_states"],
+                mla_params["attn_metadata"],
+                all_reduce_params=mla_params["all_reduce_params"],
+                idx_overlap=mla_params["idx_overlap"],
+            )
+        else:
+            attn_out_latent = self.mqa.forward(
+                mla_params["fused_q"],
+                None,
+                None,
+                mla_params["attn_metadata"],
+                attention_input_type=AttentionInputType.generation_only,
+                out_scale=mla_params["out_scale"],
+                latent_cache=mla_params["latent_cache"],  # kvcache and k_pe
+                q_pe=mla_params["q_pe"],  # used by `invokeMLARopeGeneration`
+            )
+
+            assert (attn_out_latent.shape[0] == mla_params["q"].shape[0] and
+                    attn_out_latent.shape[1] == self.num_heads * self.kv_lora_rank)
+
+            # [seq, num_heads, kv_lora_rank]
+            attn_out_latent = attn_out_latent.view(
+                [-1, self.num_heads, self.kv_lora_rank])
+
+            mla_params["attn_out_latent"] = attn_out_latent
+        return mla_params
+
+    def run_post_gemm(self, mla_params):
+        if mla_params["attn_metadata"].num_contexts > 0:
+            attn_output = mla_params["attn_output"]
+        else:
+            attn_out_latent = mla_params["attn_out_latent"]
+            # [seq, num_heads * v_head_dim]
+            output = mla_params["output"] if mla_params["output"] is not None else torch.empty(
+                [mla_params["num_tokens"], self.num_heads * self.v_head_dim],
+                dtype=attn_out_latent.dtype,
+                device=attn_out_latent.device)
+
+            attn_output = output.view([mla_params["num_tokens"], self.num_heads, self.v_head_dim])
+
+            if self.v_b_proj.dtype == torch.bfloat16:
+                # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+                # -> [num_heads, seq, v_head_dim]
+                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                        self.v_b_proj.transpose(1, 2),
+                                        attn_output.transpose(0, 1))
+            elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+                fp8_block_scaling_bmm_out(
+                    attn_out_latent,
+                    self.v_b_proj,
+                    self.v_b_proj_scale,
+                    attn_output.transpose(0, 1),
+                    self.v_b_proj_dequant,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+
+            attn_output = self.o_proj(output, all_reduce_params=mla_params["all_reduce_params"])
+        return attn_output
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        idx_overlap: Optional[int] = None,
     ) -> torch.Tensor:
 
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
-                                                   attn_output)
+                                                   attn_output, idx_overlap)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
-                              output=attn_output)
+                              output=attn_output,
+                              idx_overlap=idx_overlap)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output

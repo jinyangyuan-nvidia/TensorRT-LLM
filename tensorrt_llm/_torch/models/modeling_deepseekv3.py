@@ -29,7 +29,7 @@ import copy
 import math
 import os
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -47,11 +47,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
+from tensorrt_llm._utils import nvtx_range
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
@@ -227,7 +228,7 @@ class DeepseekV3Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
@@ -250,7 +251,7 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream)
+                         aux_stream_dict=aux_stream_dict)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -429,6 +430,7 @@ class Deepseekv3MoE(nn.Module):
         from ..distributed import AllReduce
 
         super().__init__()
+        # self.enable_two_batch_overlap = model_config.enable_two_batch_overlap
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -457,6 +459,14 @@ class Deepseekv3MoE(nn.Module):
             layer_idx=layer_idx)
 
         self.mapping = model_config.mapping
+        # self.mapping_tbo = Mapping(
+        #     world_size=self.mapping.world_size,
+        #     tp_size=2,
+        #     pp_size=self.mapping.world_size // 2,
+        #     rank=self.mapping.rank,
+        #     gpus_per_node=self.mapping.gpus_per_node,
+        #     enable_attention_dp=False,
+        # )
 
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
         block_size = 1
@@ -477,10 +487,13 @@ class Deepseekv3MoE(nn.Module):
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
-        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.aux_stream_dict = {
+            key: aux_stream_dict[key]
+            for key in [AuxStreamType.MoeShared, AuxStreamType.MoeSharedTBO]
+        }
         self.event_dict = {
             key: torch.cuda.Event()
-            for key in [EventType.Main, EventType.MoeShared]
+            for key in [EventType.Main, EventType.MainTBO, EventType.MoeShared, EventType.MoeSharedTBO]
         }
 
     def _compute_shared_expert_tp_size(self, intermediate_size: int,
@@ -505,7 +518,7 @@ class Deepseekv3MoE(nn.Module):
         # The block scale size is 128, which requires shared_expert_intermediate_size to be divisible by 128.
         if self.use_dp:
             # If using attention DP, the shared experts also use DP instead of TP.
-            shared_tp_size = 1
+            shared_tp_size = 1 # if not self.enable_two_batch_overlap else 2
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
             # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
@@ -521,7 +534,7 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, all_rank_max_num_tokens,
-                              do_finalize):
+                              do_finalize, idx_overlap: Optional[int] = None, idx_mode: Optional[int] = None, mode_params: Optional[Dict[str, Any]] = None):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -541,9 +554,59 @@ class Deepseekv3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
+            idx_overlap=idx_overlap,
+            idx_mode=idx_mode,
+            mode_params=mode_params,
         )
 
         return routed_output
+
+    def start_shared_experts(self, hidden_states: torch.Tensor, all_rank_num_tokens: List[int], idx_overlap: int, event_dict: Dict[EventType, torch.cuda.Event]) -> torch.Tensor:
+        if idx_overlap == 0:
+            aux_stream = self.aux_stream_dict[AuxStreamType.MoeShared]
+            event_main = self.event_dict[EventType.Main]
+            event_aux = event_dict[EventType.MoeShared]
+        elif idx_overlap == 1:
+            aux_stream = self.aux_stream_dict[AuxStreamType.MoeSharedTBO]
+            event_main = self.event_dict[EventType.MainTBO]
+            event_aux = event_dict[EventType.MoeSharedTBO]
+        else:
+            raise ValueError(f"Invalid idx_overlap: {idx_overlap}")
+        # sizes = [all_rank_num_tokens[idx] for idx in self.mapping_tbo.tp_group]
+        event_main.record()
+        with torch.cuda.stream(aux_stream):
+            event_main.wait()
+            # if self.enable_two_batch_overlap:
+            #     hidden_states = allgather(hidden_states, self.mapping_tbo, dim=0, sizes=sizes)
+            shared_output = self.shared_experts(hidden_states)
+            if self.shared_output_scale is not None:
+                shared_output *= self.shared_output_scale
+            # if self.enable_two_batch_overlap:
+            #     shared_output = reducescatter(shared_output, self.mapping_tbo, dim=0, sizes=sizes)
+            event_aux.record()
+        return shared_output
+
+    def done_shared_experts(self, idx_overlap: int, event_dict: Dict[EventType, torch.cuda.Event]):
+        if idx_overlap == 0:
+            event_aux = event_dict[EventType.MoeShared]
+        elif idx_overlap == 1:
+            event_aux = event_dict[EventType.MoeSharedTBO]
+        else:
+            raise ValueError(f"Invalid idx_overlap: {idx_overlap}")
+        event_aux.wait()
+        return
+
+    def run_routed_experts(self, hidden_states, all_rank_num_tokens, all_rank_max_num_tokens, idx_overlap, idx_mode, mode_params=None):
+        return self.compute_routed_output(
+            hidden_states,
+            None,
+            all_rank_num_tokens,
+            all_rank_max_num_tokens,
+            do_finalize=True,
+            idx_overlap=idx_overlap,
+            idx_mode=idx_mode,
+            mode_params=mode_params,
+        )
 
     def forward(
         self,
@@ -553,6 +616,7 @@ class Deepseekv3MoE(nn.Module):
         all_rank_max_num_tokens: Optional[int] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        idx_overlap: Optional[int] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
@@ -569,13 +633,14 @@ class Deepseekv3MoE(nn.Module):
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
                                                        all_rank_max_num_tokens,
-                                                       do_finalize)
+                                                       do_finalize,
+                                                       idx_overlap=idx_overlap)
             return routed_output
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream)
+            self.event_dict[EventType.MoeShared], self.aux_stream_dict[AuxStreamType.MoeShared])
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -612,7 +677,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+            aux_stream_dict=aux_stream_dict)
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -686,6 +751,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
+        self.aux_stream = aux_stream_dict[AuxStreamType.MainTBO]
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -742,39 +808,292 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        idx_layer: Optional[int] = None,
+        num_layers: Optional[int] = None,
+        attn_metadata_full: Optional[AttentionMetadata] = None,
+        event_dict: Optional[Dict[str, torch.cuda.Event]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.disable_attn_allreduce)),
-            **kwargs,
-        )
-
-        if isinstance(self.mlp, Deepseekv3MoE):
-            return self.forward_MoE(
+        if not isinstance(position_ids, list):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            # Self Attention
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                residual=residual,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
             )
+
+            if isinstance(self.mlp, Deepseekv3MoE):
+                return self.forward_MoE(
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
+            else:
+                assert isinstance(self.mlp, GatedMLP)
+                return self.forward_mlp(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
         else:
-            assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            assert isinstance(hidden_states, list)
+            assert isinstance(attn_metadata, list)
+            assert isinstance(residual, list)
+            assert len(position_ids) == 2
+            assert len(hidden_states) == 2
+            assert len(attn_metadata) == 2
+            assert idx_layer is not None
+
+            if isinstance(self.mlp, Deepseekv3MoE):
+                is_moe = True
+            else:
+                assert isinstance(self.mlp, GatedMLP)
+                is_moe = False
+            moe_first_layer = self.model_config.pretrained_config.first_k_dense_replace
+            if not is_moe:
+                assert 0 <= idx_layer < moe_first_layer
+                batch_size_0, batch_size_1 = hidden_states[0].shape[0], hidden_states[1].shape[0]
+                hidden_states_full = torch.cat(hidden_states, dim=0)
+                if idx_layer == 0:
+                    assert residual[0] is None and residual[1] is None
+                    residual_full = hidden_states_full
+                else:
+                    residual_full = torch.cat(residual, dim=0)
+                if idx_layer == 0:
+                    hidden_states_full = self.input_layernorm(hidden_states_full)
+                hidden_states_full = self.self_attn(
+                    position_ids=torch.cat(position_ids, dim=1),
+                    hidden_states=hidden_states_full,
+                    attn_metadata=attn_metadata_full,
+                    all_reduce_params=AllReduceParams(
+                        enable_allreduce=not (self.disable_attn_allreduce)),
+                    **kwargs,
+                )
+                hidden_states_full, residual_full = self.forward_mlp(
+                    hidden_states=hidden_states_full,
+                    residual=residual_full,
+                )
+                hidden_states[0], hidden_states[1] = hidden_states_full.split([batch_size_0, batch_size_1], dim=0)
+                residual[0], residual[1] = residual_full.split([batch_size_0, batch_size_1], dim=0)
+            else:
+                assert moe_first_layer <= idx_layer < num_layers
+
+                @nvtx_range("run_pre_gemm")
+                def _run_pre_gemm(idx_overlap):
+                    mla_params = self.self_attn.run_pre_gemm(
+                        position_ids=position_ids[idx_overlap],
+                        hidden_states=hidden_states[idx_overlap],
+                        attn_metadata=attn_metadata[idx_overlap],
+                        all_reduce_params=AllReduceParams(
+                            enable_allreduce=not (self.disable_attn_allreduce)),
+                        idx_overlap=idx_overlap,
+                        **kwargs,
+                    )
+                    return mla_params
+                
+                @nvtx_range("run_mla")
+                def _run_mla(mla_params):
+                    mla_params = self.self_attn.run_mla(mla_params)
+                    return mla_params
+
+                @nvtx_range("run_post_gemm")
+                def _run_post_gemm(mla_params, idx_overlap):
+                    x_hidden = self.self_attn.run_post_gemm(mla_params)
+                    x_hidden, x_residual = self.post_attention_layernorm(x_hidden, residual[idx_overlap])
+                    return x_hidden, x_residual
+
+                @nvtx_range("run_router")
+                def _run_router(idx_overlap):
+                    return self.mlp.run_routed_experts(
+                        hidden_states[idx_overlap],
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        idx_overlap=idx_overlap,
+                        idx_mode=0,
+                    )
+
+                @nvtx_range("start_dispatch")
+                def _start_dispatch(mode_params):
+                    if mode_params["dispatch_func"] is not None:
+                        outputs, hook = mode_params["dispatch_func"](*mode_params["dispatch_args"])
+                        mode_params.update(outputs)
+                    else:
+                        hook = None
+                    return mode_params, hook
+                
+                @nvtx_range("done_dispatch")
+                def _done_dispatch(hook):
+                    if hook is not None:
+                        hook()
+                    return
+
+                @nvtx_range("start_shared_experts")
+                def _start_shared_experts(idx_overlap):
+                    return self.mlp.start_shared_experts(hidden_states[idx_overlap], attn_metadata[idx_overlap].all_rank_num_tokens, idx_overlap, event_dict)
+
+                @nvtx_range("done_shared_experts")
+                def _done_shared_experts(idx_overlap):
+                    self.mlp.done_shared_experts(idx_overlap, event_dict)
+                    return
+
+                @nvtx_range("run_routed_experts")
+                def _run_routed_experts(mode_params, idx_overlap):
+                    return self.mlp.run_routed_experts(
+                        hidden_states[idx_overlap],
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        idx_overlap=idx_overlap,
+                        idx_mode=1,
+                        mode_params=mode_params,
+                    )
+
+                @nvtx_range("start_combine")
+                def _start_combine(mode_params, idx_overlap):
+                    return self.mlp.run_routed_experts(
+                        hidden_states[idx_overlap],
+                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                        idx_overlap=idx_overlap,
+                        idx_mode=2,
+                        mode_params=mode_params,
+                    )
+
+                @nvtx_range("done_combine")
+                def _done_combine(hook):
+                    if hook is not None:
+                        hook()
+                    return
+
+                @nvtx_range("finalize_moe")
+                def _finalize_moe(x_shared, x_routed, idx_overlap, layernorm_fn=None):
+                    x_hidden = x_shared + x_routed
+                    if layernorm_fn is None:
+                        layernorm_fn = self.next_layer_layernorm
+                    if layernorm_fn is not None:
+                        x_hidden, x_residual = layernorm_fn(x_hidden, residual[idx_overlap])
+                    return x_hidden, x_residual
+
+                # Pre-GEMM 0
+                mla_params_0 = _run_pre_gemm(0)
+                if idx_layer == moe_first_layer:
+                    # MLA 0
+                    mla_params_0 = _run_mla(mla_params_0)
+                    event_dict[EventType.Main].record()
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                    # Post-GEMM 0
+                    hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
+                    # Router 0
+                    routed_params_0 = _run_router(0)
+                    # Start dispatch 0
+                    routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
+                    event_dict[EventType.Main].record()
+                else:
+                    # MLA 0
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.MainTBO].record()
+                    event_dict[EventType.MainTBO].wait()
+                    mla_params_0 = _run_mla(mla_params_0)
+                    event_dict[EventType.Main].record()
+                    # Done combine 1 in the previous layer
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                        _done_combine(event_dict["hook_combine_1"])
+                        event_dict[EventType.MainTBO].record()
+                    # Post-GEMM 0
+                    hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
+                    # Router 0
+                    routed_params_0 = _run_router(0)
+                    # Start dispatch 0
+                    event_dict[EventType.MainTBO].wait()
+                    routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
+                    event_dict[EventType.Main].record()
+                    # Finalize 1 in the previous layer
+                    with torch.cuda.stream(self.aux_stream):
+                        _done_shared_experts(1)
+                        hidden_states[1], residual[1] = _finalize_moe(event_dict["x_shared_1"], event_dict["x_routed_1"], 1, layernorm_fn=event_dict["layernorm_fn_1"])
+                # Start shared experts 0
+                x_shared_0 = _start_shared_experts(0)
+                # Pre-GEMM 1
+                with torch.cuda.stream(self.aux_stream):
+                    mla_params_1 = _run_pre_gemm(1)
+                # MLA 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    mla_params_1 = _run_mla(mla_params_1)
+                    event_dict[EventType.MainTBO].record()
+                # Done dispatch 0
+                event_dict[EventType.MainTBO].wait()
+                _done_dispatch(hook_dispatch_0)
+                event_dict[EventType.Main].record()
+                # Post-GEMM 1
+                with torch.cuda.stream(self.aux_stream):
+                    hidden_states[1], residual[1] = _run_post_gemm(mla_params_1, 1)
+                # Router 1
+                with torch.cuda.stream(self.aux_stream):
+                    routed_params_1 = _run_router(1)
+                    event_dict[EventType.MainTBO].record()
+                # Start dispatch 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    routed_params_1, hook_dispatch_1 = _start_dispatch(routed_params_1)
+                # Routed experts 0
+                event_dict[EventType.MainTBO].wait()
+                routed_params_0 = _run_routed_experts(routed_params_0, 0)
+                event_dict[EventType.Main].record()
+                # Done dispatch 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    _done_dispatch(hook_dispatch_1)
+                    event_dict[EventType.MainTBO].record()
+                # Start combine 0
+                event_dict[EventType.MainTBO].wait()
+                x_routed_0, hook_combine_0 = _start_combine(routed_params_0, 0)
+                # Routed experts 1
+                with torch.cuda.stream(self.aux_stream):
+                    routed_params_1 = _run_routed_experts(routed_params_1, 1)
+                    event_dict[EventType.MainTBO].record()
+                # Done combine 0
+                event_dict[EventType.MainTBO].wait()
+                _done_combine(hook_combine_0)
+                event_dict[EventType.Main].record()
+                # Start combine 1
+                with torch.cuda.stream(self.aux_stream):
+                    event_dict[EventType.Main].wait()
+                    x_routed_1, hook_combine_1 = _start_combine(routed_params_1, 1)
+                # Start shared experts 1
+                with torch.cuda.stream(self.aux_stream):
+                    x_shared_1 = _start_shared_experts(1)
+                # Finalize 0
+                _done_shared_experts(0)
+                hidden_states[0], residual[0] = _finalize_moe(x_shared_0, x_routed_0, 0)
+                # Done combine and finalize 1 or prepare for the next layer
+                if idx_layer == num_layers - 1:
+                    with torch.cuda.stream(self.aux_stream):
+                        _done_combine(hook_combine_1)
+                        _done_shared_experts(1)
+                        hidden_states[1], residual[1] = _finalize_moe(x_shared_1, x_routed_1, 1)
+                        event_dict[EventType.MainTBO].record()
+                    event_dict[EventType.MainTBO].wait()
+                else:
+                    event_dict["x_shared_1"] = x_shared_1
+                    event_dict["x_routed_1"] = x_routed_1
+                    event_dict["hook_combine_1"] = hook_combine_1
+                    event_dict["routed_params_1"] = routed_params_1
+                    event_dict["layernorm_fn_1"] = self.next_layer_layernorm
+            return hidden_states, residual
 
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        idx_overlap: Optional[int] = None,
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
@@ -787,6 +1106,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
                 do_finalize=do_finalize,
+                idx_overlap=idx_overlap,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1049,12 +1369,19 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(7)]
         self.aux_stream_dict = {
-            AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared: aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MainTBO: aux_stream_list[0],
+            AuxStreamType.Attention: aux_stream_list[1],
+            AuxStreamType.AttentionTBO: aux_stream_list[2],
+            AuxStreamType.MoeShared: aux_stream_list[3],
+            AuxStreamType.MoeSharedTBO: aux_stream_list[4],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[5],
+            AuxStreamType.MoeBalancer: aux_stream_list[6],
+        }
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MainTBO, EventType.MoeShared, EventType.MoeSharedTBO]
         }
 
         self.embed_tokens = Embedding(
@@ -1078,24 +1405,37 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        attn_metadata_full: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
+        if not isinstance(attn_metadata, list):
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            residual = None
+        else:
+            assert isinstance(input_ids, list)
+            assert isinstance(position_ids, list)
+            assert inputs_embeds is None
+            inputs_embeds = [
+                self.embed_tokens(input_ids[idx_overlap])
+                for idx_overlap in [0, 1]
+            ]
+            residual = [None, None]
         hidden_states = inputs_embeds
-        residual = None
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+        for idx_layer, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                idx_layer=idx_layer,
+                num_layers=self.num_hidden_layers,
+                attn_metadata_full=attn_metadata_full,
+                event_dict=self.event_dict,
             )
 
         return hidden_states
@@ -1175,15 +1515,39 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[MTPSpecMetadata] = None,
         return_context_logits: bool = False,
+        input_ids_overlap_0: Optional[torch.IntTensor] = None,
+        input_ids_overlap_1: Optional[torch.IntTensor] = None,
+        position_ids_overlap_0: Optional[torch.IntTensor] = None,
+        position_ids_overlap_1: Optional[torch.IntTensor] = None,
+        attn_metadata_overlap_0: AttentionMetadata = None,
+        attn_metadata_overlap_1: AttentionMetadata = None,
         **kwargs,
     ) -> torch.Tensor:
+        assert inputs_embeds is None
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
+        if input_ids_overlap_0 is not None:
+            assert input_ids_overlap_1 is not None
+            assert position_ids_overlap_0 is not None
+            assert position_ids_overlap_1 is not None
+            assert attn_metadata_overlap_0 is not None
+            assert attn_metadata_overlap_1 is not None
+            attn_metadata_overlap_0.num_generations_per_batch = self.model_nextn + 1
+            attn_metadata_overlap_1.num_generations_per_batch = self.model_nextn + 1
+            hidden_states_overlap_0, hidden_states_overlap_1 = self.model(
+                input_ids=[input_ids_overlap_0, input_ids_overlap_1],
+                attn_metadata=[attn_metadata_overlap_0, attn_metadata_overlap_1],
+                position_ids=[position_ids_overlap_0, position_ids_overlap_1],
+                inputs_embeds=None,
+                attn_metadata_full=attn_metadata,
+            )
+            hidden_states = torch.cat([hidden_states_overlap_0, hidden_states_overlap_1], dim=0)
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits
