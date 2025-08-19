@@ -97,7 +97,7 @@ void initMoeBindings(pybind11::module_& m)
 
     // Bind MoeLoadBalancer class
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
-        .def(py::init<int, int, int>(), py::arg("ep_rank"), py::arg("ep_size"), py::arg("layer_updates_per_iter"),
+        .def(py::init<int, int, int, bool, int, int>(), py::arg("ep_rank"), py::arg("ep_size"), py::arg("layer_updates_per_iter"), py::arg("afd_enabled"), py::arg("afd_attn_size"), py::arg("afd_moe_size"),
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, py::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates")

@@ -312,7 +312,10 @@ class ExecutorRequestQueue:
             all_ranks_num_active_requests.append(num_active_requests)
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        if not self.dist.enable_afd:
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        else:
+            total_max_num_active_requests = self.dist.afd_attn_size * 2 * self.max_num_active_requests
 
         # fetch and process requests into waiting queue
         new_requests = self._fetch_and_process_requests(
@@ -377,18 +380,27 @@ class ExecutorRequestQueue:
             if not scheduled:
                 remaining_unscheduled.append(req_item)
 
+        if not self.dist.enable_afd:
+            num_adp_ranks = self.dist.tp_size
+        else:
+            num_adp_ranks = self.dist.afd_attn_size * 2
+            
         # Balance the remaining unscheduled requests across ranks
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.tp_size - 1) // self.dist.tp_size,
+            num_adp_ranks - 1) // num_adp_ranks,
             max(all_ranks_num_active_requests),
         )
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
             remaining_unscheduled, all_ranks_new_requests,
             all_ranks_num_active_requests)
+
+        # if self.dist.rank == 0:
+        #     for idx, val in all_ranks_new_requests.items():
+        #         print(f"{idx=}, {len(val)=}")
 
         return all_ranks_new_requests
 
@@ -454,9 +466,14 @@ class ExecutorRequestQueue:
                 'HeapVal',
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
+            if not self.dist.enable_afd:
+                num_adp_ranks = self.dist.tp_size
+            else:
+                num_adp_ranks = self.dist.afd_attn_size * 2
+
             all_ranks_new_requests_heap = [
                 HeapVal(0, val, tp_rank, [])
-                for tp_rank, val in enumerate(all_ranks_num_active_requests)
+                for tp_rank, val in enumerate(all_ranks_num_active_requests) if tp_rank < num_adp_ranks
             ]
 
             all_ranks_new_requests_heap = [

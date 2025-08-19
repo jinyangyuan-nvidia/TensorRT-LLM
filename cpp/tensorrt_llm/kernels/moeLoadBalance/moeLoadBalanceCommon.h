@@ -48,6 +48,11 @@ struct MoeLoadBalanceMetaInfo
 
     // Slot Info
     int slotCountPerRank;
+
+    // AFD Info
+    bool afdEnabled;
+    int afdAttnSize;
+    int afdMoeSize;
 };
 
 struct MoeLoadBalanceStatisticInfo

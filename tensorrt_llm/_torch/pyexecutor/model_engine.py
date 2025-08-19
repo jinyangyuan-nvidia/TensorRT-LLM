@@ -312,6 +312,9 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
             moe_load_balancer=pytorch_backend_config.moe_load_balancer,
             enable_two_batch_overlap=pytorch_backend_config.enable_two_batch_overlap,
+            enable_afd=pytorch_backend_config.enable_afd,
+            afd_attn_size=pytorch_backend_config.afd_attn_size,
+            afd_moe_size=pytorch_backend_config.afd_moe_size,
             lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -1009,6 +1012,8 @@ class PyTorchModelEngine(ModelEngine):
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
             all_can_graph_batch = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
+            if self.pytorch_backend_config.enable_afd:
+                all_can_graph_batch = all_can_graph_batch[:self.pytorch_backend_config.afd_attn_size * 2]
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
             all_batch_size_equal = all(
@@ -1017,6 +1022,8 @@ class PyTorchModelEngine(ModelEngine):
 
             if not is_all_gen_only or not all_batch_size_equal:
                 return None
+
+            batch_size = all_can_graph_batch[0][1]
 
         if not self._run_cuda_graphs or not can_run_cuda_graph:
             return None
@@ -1058,7 +1065,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
             batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
-            self.max_beam_width, attn_metadata_overlap_0=attn_metadata_overlap_0, attn_metadata_overlap_1=attn_metadata_overlap_1)
+            self.max_beam_width, attn_metadata_overlap_0=attn_metadata_overlap_0, attn_metadata_overlap_1=attn_metadata_overlap_1,
+            disable_prepare=self.pytorch_backend_config.enable_afd and self.mapping.tp_rank >= self.pytorch_backend_config.afd_attn_size * 2)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -1076,6 +1084,9 @@ class PyTorchModelEngine(ModelEngine):
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     enable_two_batch_overlap: bool = False,
+                    enable_afd: bool = False,
+                    afd_attn_size: Optional[int] = None,
+                    afd_moe_size: Optional[int] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs) -> DecoderModelForCausalLM:
         config = checkpoint_loader.load_config(
@@ -1091,6 +1102,9 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             enable_two_batch_overlap=enable_two_batch_overlap,
+            enable_afd=enable_afd,
+            afd_attn_size=afd_attn_size,
+            afd_moe_size=afd_moe_size,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)

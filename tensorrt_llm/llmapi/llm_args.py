@@ -224,6 +224,9 @@ class _ParallelConfig:
     cp_config: dict = field(default_factory=dict)
     enable_attention_dp: bool = False
     auto_parallel: bool = False
+    enable_afd: bool = False
+    afd_attn_size: Optional[int] = None
+    afd_moe_size: Optional[int] = None
 
     _world_size: int = field(default=1, init=False)
     _devices: Optional[List[int]] = field(default=None, init=False)
@@ -289,7 +292,10 @@ class _ParallelConfig:
                        moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
-                       auto_parallel=self.auto_parallel)
+                       auto_parallel=self.auto_parallel,
+                       enable_afd=self.enable_afd,
+                       afd_attn_size=self.afd_attn_size,
+                       afd_moe_size=self.afd_moe_size)
 
 
 class CalibConfig(StrictBaseModel):
@@ -1198,6 +1204,21 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable two batch overlap.",
         status="prototype")
 
+    enable_afd: bool = Field(
+        default=False,
+        description="Enable AFD.",
+        status="prototype")
+    
+    afd_attn_size: Optional[int] = Field(
+        default=None,
+        description="The attention size for AFD.",
+        status="prototype")
+    
+    afd_moe_size: Optional[int] = Field(
+        default=None,
+        description="The MoE size for AFD.",
+        status="prototype")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -1445,7 +1466,10 @@ class BaseLlmArgs(StrictBaseModel):
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
-            cp_config=self.cp_config)
+            cp_config=self.cp_config,
+            enable_afd=self.enable_afd,
+            afd_attn_size=self.afd_attn_size,
+            afd_moe_size=self.afd_moe_size)
         return self
 
     @model_validator(mode="after")
@@ -2347,6 +2371,9 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_max_num_tokens=self.moe_config.max_num_tokens,
             moe_load_balancer=self.moe_config.load_balancer,
             enable_two_batch_overlap=self.enable_two_batch_overlap,
+            enable_afd=self.enable_afd,
+            afd_attn_size=self.afd_attn_size,
+            afd_moe_size=self.afd_moe_size,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,

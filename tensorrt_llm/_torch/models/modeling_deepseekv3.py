@@ -29,6 +29,7 @@ import copy
 import math
 import os
 import warnings
+from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -47,7 +48,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
-from tensorrt_llm._utils import nvtx_range
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -534,7 +534,7 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, all_rank_max_num_tokens,
-                              do_finalize, idx_overlap: Optional[int] = None, idx_mode: Optional[int] = None, mode_params: Optional[Dict[str, Any]] = None):
+                              do_finalize, idx_overlap: Optional[int] = None, idx_mode: Optional[int] = None, mode_params: Optional[Dict[str, Any]] = None, idx_chunk: int = 0):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -557,6 +557,7 @@ class Deepseekv3MoE(nn.Module):
             idx_overlap=idx_overlap,
             idx_mode=idx_mode,
             mode_params=mode_params,
+            idx_chunk=idx_chunk,
         )
 
         return routed_output
@@ -596,7 +597,7 @@ class Deepseekv3MoE(nn.Module):
         event_aux.wait()
         return
 
-    def run_routed_experts(self, hidden_states, all_rank_num_tokens, all_rank_max_num_tokens, idx_overlap, idx_mode, mode_params=None):
+    def run_routed_experts(self, hidden_states, all_rank_num_tokens, all_rank_max_num_tokens, idx_overlap, idx_mode, mode_params=None, idx_chunk=0):
         return self.compute_routed_output(
             hidden_states,
             None,
@@ -606,6 +607,7 @@ class Deepseekv3MoE(nn.Module):
             idx_overlap=idx_overlap,
             idx_mode=idx_mode,
             mode_params=mode_params,
+            idx_chunk=idx_chunk,
         )
 
     def forward(
@@ -656,6 +658,23 @@ class Deepseekv3MoE(nn.Module):
             return final_hidden_states
 
 
+class AFDGroup(IntEnum):
+    # Attention 0
+    ATTN_0 = 0
+    # Attention 1
+    ATTN_1 = 1
+    # MoE
+    MOE = 2
+
+
+class DummyAttentionLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, hidden_states, *args, **kwargs):
+        return hidden_states
+
+
 class DeepseekV3DecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
@@ -664,6 +683,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
+
+        self.afd_enabled = model_config.mapping.enable_afd
+        self.afd_attn_size = model_config.mapping.afd_attn_size
+        self.afd_moe_size = model_config.mapping.afd_moe_size
+        if self.afd_enabled:
+            if model_config.mapping.tp_rank < self.afd_attn_size:
+                self.afd_group = AFDGroup.ATTN_0
+            elif model_config.mapping.tp_rank < self.afd_attn_size * 2:
+                self.afd_group = AFDGroup.ATTN_1
+            else:
+                self.afd_group = AFDGroup.MOE
+        else:
+            self.afd_group = None
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -674,10 +706,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         mapping = self.mapping
 
-        self.self_attn = DeepseekV3Attention(
-            model_config,
-            layer_idx=layer_idx,
-            aux_stream_dict=aux_stream_dict)
+        if self.afd_group != AFDGroup.MOE:
+            self.self_attn = DeepseekV3Attention(
+                model_config,
+                layer_idx=layer_idx,
+                aux_stream_dict=aux_stream_dict)
+        else:
+            self.self_attn = DummyAttentionLayer()
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -883,209 +918,600 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             else:
                 assert moe_first_layer <= idx_layer < num_layers
 
-                @nvtx_range("run_pre_gemm")
-                def _run_pre_gemm(idx_overlap):
-                    mla_params = self.self_attn.run_pre_gemm(
-                        position_ids=position_ids[idx_overlap],
-                        hidden_states=hidden_states[idx_overlap],
-                        attn_metadata=attn_metadata[idx_overlap],
-                        all_reduce_params=AllReduceParams(
-                            enable_allreduce=not (self.disable_attn_allreduce)),
-                        idx_overlap=idx_overlap,
-                        **kwargs,
-                    )
-                    return mla_params
-                
-                @nvtx_range("run_mla")
-                def _run_mla(mla_params):
-                    mla_params = self.self_attn.run_mla(mla_params)
-                    return mla_params
+                if not self.afd_enabled:
 
-                @nvtx_range("run_post_gemm")
-                def _run_post_gemm(mla_params, idx_overlap):
-                    x_hidden = self.self_attn.run_post_gemm(mla_params)
-                    x_hidden, x_residual = self.post_attention_layernorm(x_hidden, residual[idx_overlap])
-                    return x_hidden, x_residual
+                    def _run_pre_gemm(idx_overlap):
+                        mla_params = self.self_attn.run_pre_gemm(
+                            position_ids=position_ids[idx_overlap],
+                            hidden_states=hidden_states[idx_overlap],
+                            attn_metadata=attn_metadata[idx_overlap],
+                            all_reduce_params=AllReduceParams(
+                                enable_allreduce=not (self.disable_attn_allreduce)),
+                            idx_overlap=idx_overlap,
+                            **kwargs,
+                        )
+                        return mla_params
 
-                @nvtx_range("run_router")
-                def _run_router(idx_overlap):
-                    return self.mlp.run_routed_experts(
-                        hidden_states[idx_overlap],
-                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
-                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
-                        idx_overlap=idx_overlap,
-                        idx_mode=0,
-                    )
+                    def _run_mla(mla_params):
+                        mla_params = self.self_attn.run_mla(mla_params)
+                        return mla_params
 
-                @nvtx_range("start_dispatch")
-                def _start_dispatch(mode_params):
-                    if mode_params["dispatch_func"] is not None:
-                        outputs, hook = mode_params["dispatch_func"](*mode_params["dispatch_args"])
-                        mode_params.update(outputs)
+                    def _run_post_gemm(mla_params, idx_overlap):
+                        x_hidden = self.self_attn.run_post_gemm(mla_params)
+                        x_hidden, x_residual = self.post_attention_layernorm(x_hidden, residual[idx_overlap])
+                        return x_hidden, x_residual
+
+                    def _start_shared_experts(idx_overlap):
+                        return self.mlp.start_shared_experts(hidden_states[idx_overlap], attn_metadata[idx_overlap].all_rank_num_tokens, idx_overlap, event_dict)
+
+                    def _done_shared_experts(idx_overlap):
+                        self.mlp.done_shared_experts(idx_overlap, event_dict)
+                        return
+
+                    def _run_router(idx_overlap):
+                        return self.mlp.run_routed_experts(
+                            hidden_states[idx_overlap],
+                            all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                            all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                            idx_overlap=idx_overlap,
+                            idx_mode=0,
+                        )
+
+                    def _start_dispatch(mode_params):
+                        if mode_params["dispatch_func"] is not None:
+                            outputs, hook = mode_params["dispatch_func"](*mode_params["dispatch_args"])
+                            mode_params.update(outputs)
+                        else:
+                            hook = None
+                        return mode_params, hook
+
+                    def _done_dispatch(hook):
+                        if hook is not None:
+                            hook()
+                        return
+
+                    def _run_routed_experts(mode_params, idx_overlap):
+                        return self.mlp.run_routed_experts(
+                            hidden_states[idx_overlap],
+                            all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                            all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                            idx_overlap=idx_overlap,
+                            idx_mode=1,
+                            mode_params=mode_params,
+                        )
+
+                    def _start_combine(mode_params, idx_overlap):
+                        return self.mlp.run_routed_experts(
+                            hidden_states[idx_overlap],
+                            all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                            all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                            idx_overlap=idx_overlap,
+                            idx_mode=2,
+                            mode_params=mode_params,
+                        )
+
+                    def _done_combine(hook):
+                        if hook is not None:
+                            hook()
+                        return
+
+                    def _finalize_moe(x_shared, x_routed, idx_overlap, layernorm_fn=None):
+                        x_hidden = x_shared + x_routed
+                        if layernorm_fn is None:
+                            layernorm_fn = self.next_layer_layernorm
+                        if layernorm_fn is not None:
+                            x_hidden, x_residual = layernorm_fn(x_hidden, residual[idx_overlap])
+                        return x_hidden, x_residual
+
+                    # Pre-GEMM 0
+                    mla_params_0 = _run_pre_gemm(0)
+                    if idx_layer == moe_first_layer:
+                        # MLA 0
+                        mla_params_0 = _run_mla(mla_params_0)
+                        event_dict[EventType.Main].record()
+                        with torch.cuda.stream(self.aux_stream):
+                            event_dict[EventType.Main].wait()
+                        # Post-GEMM 0
+                        hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
+                        # Router 0
+                        routed_params_0 = _run_router(0)
+                        # Start dispatch 0
+                        routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
+                        event_dict[EventType.Main].record()
                     else:
-                        hook = None
-                    return mode_params, hook
-                
-                @nvtx_range("done_dispatch")
-                def _done_dispatch(hook):
-                    if hook is not None:
-                        hook()
-                    return
-
-                @nvtx_range("start_shared_experts")
-                def _start_shared_experts(idx_overlap):
-                    return self.mlp.start_shared_experts(hidden_states[idx_overlap], attn_metadata[idx_overlap].all_rank_num_tokens, idx_overlap, event_dict)
-
-                @nvtx_range("done_shared_experts")
-                def _done_shared_experts(idx_overlap):
-                    self.mlp.done_shared_experts(idx_overlap, event_dict)
-                    return
-
-                @nvtx_range("run_routed_experts")
-                def _run_routed_experts(mode_params, idx_overlap):
-                    return self.mlp.run_routed_experts(
-                        hidden_states[idx_overlap],
-                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
-                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
-                        idx_overlap=idx_overlap,
-                        idx_mode=1,
-                        mode_params=mode_params,
-                    )
-
-                @nvtx_range("start_combine")
-                def _start_combine(mode_params, idx_overlap):
-                    return self.mlp.run_routed_experts(
-                        hidden_states[idx_overlap],
-                        all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
-                        all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
-                        idx_overlap=idx_overlap,
-                        idx_mode=2,
-                        mode_params=mode_params,
-                    )
-
-                @nvtx_range("done_combine")
-                def _done_combine(hook):
-                    if hook is not None:
-                        hook()
-                    return
-
-                @nvtx_range("finalize_moe")
-                def _finalize_moe(x_shared, x_routed, idx_overlap, layernorm_fn=None):
-                    x_hidden = x_shared + x_routed
-                    if layernorm_fn is None:
-                        layernorm_fn = self.next_layer_layernorm
-                    if layernorm_fn is not None:
-                        x_hidden, x_residual = layernorm_fn(x_hidden, residual[idx_overlap])
-                    return x_hidden, x_residual
-
-                # Pre-GEMM 0
-                mla_params_0 = _run_pre_gemm(0)
-                if idx_layer == moe_first_layer:
-                    # MLA 0
-                    mla_params_0 = _run_mla(mla_params_0)
-                    event_dict[EventType.Main].record()
+                        # MLA 0
+                        with torch.cuda.stream(self.aux_stream):
+                            event_dict[EventType.MainTBO].record()
+                        event_dict[EventType.MainTBO].wait()
+                        mla_params_0 = _run_mla(mla_params_0)
+                        event_dict[EventType.Main].record()
+                        # Done combine 1 in the previous layer
+                        with torch.cuda.stream(self.aux_stream):
+                            event_dict[EventType.Main].wait()
+                            _done_combine(event_dict["hook_combine_1"])
+                            event_dict[EventType.MainTBO].record()
+                        # Post-GEMM 0
+                        hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
+                        # Router 0
+                        routed_params_0 = _run_router(0)
+                        # Start dispatch 0
+                        event_dict[EventType.MainTBO].wait()
+                        routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
+                        event_dict[EventType.Main].record()
+                        # Finalize 1 in the previous layer
+                        with torch.cuda.stream(self.aux_stream):
+                            _done_shared_experts(1)
+                            hidden_states[1], residual[1] = _finalize_moe(event_dict["x_shared_1"], event_dict["x_routed_1"], 1, layernorm_fn=event_dict["layernorm_fn_1"])
+                    # Start shared experts 0
+                    x_shared_0 = _start_shared_experts(0)
+                    # Pre-GEMM 1
+                    with torch.cuda.stream(self.aux_stream):
+                        mla_params_1 = _run_pre_gemm(1)
+                    # MLA 1
                     with torch.cuda.stream(self.aux_stream):
                         event_dict[EventType.Main].wait()
-                    # Post-GEMM 0
-                    hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
-                    # Router 0
-                    routed_params_0 = _run_router(0)
-                    # Start dispatch 0
-                    routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
+                        mla_params_1 = _run_mla(mla_params_1)
+                        event_dict[EventType.MainTBO].record()
+                    # Done dispatch 0
+                    event_dict[EventType.MainTBO].wait()
+                    _done_dispatch(hook_dispatch_0)
                     event_dict[EventType.Main].record()
+                    # Post-GEMM 1
+                    with torch.cuda.stream(self.aux_stream):
+                        hidden_states[1], residual[1] = _run_post_gemm(mla_params_1, 1)
+                    # Router 1
+                    with torch.cuda.stream(self.aux_stream):
+                        routed_params_1 = _run_router(1)
+                        event_dict[EventType.MainTBO].record()
+                    # Start dispatch 1
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                        routed_params_1, hook_dispatch_1 = _start_dispatch(routed_params_1)
+                    # Routed experts 0
+                    event_dict[EventType.MainTBO].wait()
+                    routed_params_0 = _run_routed_experts(routed_params_0, 0)
+                    event_dict[EventType.Main].record()
+                    # Done dispatch 1
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                        _done_dispatch(hook_dispatch_1)
+                        event_dict[EventType.MainTBO].record()
+                    # Start combine 0
+                    event_dict[EventType.MainTBO].wait()
+                    x_routed_0, hook_combine_0 = _start_combine(routed_params_0, 0)
+                    # Routed experts 1
+                    with torch.cuda.stream(self.aux_stream):
+                        routed_params_1 = _run_routed_experts(routed_params_1, 1)
+                        event_dict[EventType.MainTBO].record()
+                    # Done combine 0
+                    event_dict[EventType.MainTBO].wait()
+                    _done_combine(hook_combine_0)
+                    event_dict[EventType.Main].record()
+                    # Start combine 1
+                    with torch.cuda.stream(self.aux_stream):
+                        event_dict[EventType.Main].wait()
+                        x_routed_1, hook_combine_1 = _start_combine(routed_params_1, 1)
+                    # Start shared experts 1
+                    with torch.cuda.stream(self.aux_stream):
+                        x_shared_1 = _start_shared_experts(1)
+                    # Finalize 0
+                    _done_shared_experts(0)
+                    hidden_states[0], residual[0] = _finalize_moe(x_shared_0, x_routed_0, 0)
+                    # Done combine and finalize 1 or prepare for the next layer
+                    if idx_layer == num_layers - 1:
+                        with torch.cuda.stream(self.aux_stream):
+                            _done_combine(hook_combine_1)
+                            _done_shared_experts(1)
+                            hidden_states[1], residual[1] = _finalize_moe(x_shared_1, x_routed_1, 1)
+                            event_dict[EventType.MainTBO].record()
+                        event_dict[EventType.MainTBO].wait()
+                    else:
+                        event_dict["x_shared_1"] = x_shared_1
+                        event_dict["x_routed_1"] = x_routed_1
+                        event_dict["hook_combine_1"] = hook_combine_1
+                        event_dict["routed_params_1"] = routed_params_1
+                        event_dict["layernorm_fn_1"] = self.next_layer_layernorm
+
                 else:
-                    # MLA 0
-                    with torch.cuda.stream(self.aux_stream):
-                        event_dict[EventType.MainTBO].record()
-                    event_dict[EventType.MainTBO].wait()
-                    mla_params_0 = _run_mla(mla_params_0)
-                    event_dict[EventType.Main].record()
-                    # Done combine 1 in the previous layer
-                    with torch.cuda.stream(self.aux_stream):
-                        event_dict[EventType.Main].wait()
-                        _done_combine(event_dict["hook_combine_1"])
-                        event_dict[EventType.MainTBO].record()
-                    # Post-GEMM 0
-                    hidden_states[0], residual[0] = _run_post_gemm(mla_params_0, 0)
-                    # Router 0
-                    routed_params_0 = _run_router(0)
-                    # Start dispatch 0
-                    event_dict[EventType.MainTBO].wait()
-                    routed_params_0, hook_dispatch_0 = _start_dispatch(routed_params_0)
-                    event_dict[EventType.Main].record()
-                    # Finalize 1 in the previous layer
-                    with torch.cuda.stream(self.aux_stream):
-                        _done_shared_experts(1)
-                        hidden_states[1], residual[1] = _finalize_moe(event_dict["x_shared_1"], event_dict["x_routed_1"], 1, layernorm_fn=event_dict["layernorm_fn_1"])
-                # Start shared experts 0
-                x_shared_0 = _start_shared_experts(0)
-                # Pre-GEMM 1
-                with torch.cuda.stream(self.aux_stream):
-                    mla_params_1 = _run_pre_gemm(1)
-                # MLA 1
-                with torch.cuda.stream(self.aux_stream):
-                    event_dict[EventType.Main].wait()
-                    mla_params_1 = _run_mla(mla_params_1)
-                    event_dict[EventType.MainTBO].record()
-                # Done dispatch 0
-                event_dict[EventType.MainTBO].wait()
-                _done_dispatch(hook_dispatch_0)
-                event_dict[EventType.Main].record()
-                # Post-GEMM 1
-                with torch.cuda.stream(self.aux_stream):
-                    hidden_states[1], residual[1] = _run_post_gemm(mla_params_1, 1)
-                # Router 1
-                with torch.cuda.stream(self.aux_stream):
-                    routed_params_1 = _run_router(1)
-                    event_dict[EventType.MainTBO].record()
-                # Start dispatch 1
-                with torch.cuda.stream(self.aux_stream):
-                    event_dict[EventType.Main].wait()
-                    routed_params_1, hook_dispatch_1 = _start_dispatch(routed_params_1)
-                # Routed experts 0
-                event_dict[EventType.MainTBO].wait()
-                routed_params_0 = _run_routed_experts(routed_params_0, 0)
-                event_dict[EventType.Main].record()
-                # Done dispatch 1
-                with torch.cuda.stream(self.aux_stream):
-                    event_dict[EventType.Main].wait()
-                    _done_dispatch(hook_dispatch_1)
-                    event_dict[EventType.MainTBO].record()
-                # Start combine 0
-                event_dict[EventType.MainTBO].wait()
-                x_routed_0, hook_combine_0 = _start_combine(routed_params_0, 0)
-                # Routed experts 1
-                with torch.cuda.stream(self.aux_stream):
-                    routed_params_1 = _run_routed_experts(routed_params_1, 1)
-                    event_dict[EventType.MainTBO].record()
-                # Done combine 0
-                event_dict[EventType.MainTBO].wait()
-                _done_combine(hook_combine_0)
-                event_dict[EventType.Main].record()
-                # Start combine 1
-                with torch.cuda.stream(self.aux_stream):
-                    event_dict[EventType.Main].wait()
-                    x_routed_1, hook_combine_1 = _start_combine(routed_params_1, 1)
-                # Start shared experts 1
-                with torch.cuda.stream(self.aux_stream):
-                    x_shared_1 = _start_shared_experts(1)
-                # Finalize 0
-                _done_shared_experts(0)
-                hidden_states[0], residual[0] = _finalize_moe(x_shared_0, x_routed_0, 0)
-                # Done combine and finalize 1 or prepare for the next layer
-                if idx_layer == num_layers - 1:
-                    with torch.cuda.stream(self.aux_stream):
+
+                    def _run_attn_part_1(idx_overlap, self_attn_fn=None, force_dummy=False):
+                        if self_attn_fn is None:
+                            self_attn_fn = self.self_attn
+                        if self.afd_group != AFDGroup.MOE and not force_dummy:
+                            mla_params = self_attn_fn.run_pre_gemm(
+                                position_ids=position_ids[idx_overlap],
+                                hidden_states=hidden_states[idx_overlap],
+                                attn_metadata=attn_metadata[idx_overlap],
+                                all_reduce_params=AllReduceParams(
+                                    enable_allreduce=not (self.disable_attn_allreduce)),
+                                idx_overlap=idx_overlap,
+                                **kwargs,
+                            )
+                            mla_params = self_attn_fn.run_mla(mla_params)
+                        else:
+                            mla_params = None
+                        return mla_params
+
+                    def _run_attn_part_2(mla_params, idx_overlap, self_attn_fn=None, mlp_fn=None, force_dummy=False):
+                        if self_attn_fn is None:
+                            self_attn_fn = self.self_attn
+                        if mlp_fn is None:
+                            mlp_fn = self.mlp
+                        if self.afd_group != AFDGroup.MOE and not force_dummy:
+                            x_hidden = self_attn_fn.run_post_gemm(mla_params)
+                            x_hidden, x_residual = self.post_attention_layernorm(x_hidden, residual[idx_overlap])
+                            x_shared = mlp_fn.start_shared_experts(
+                                x_hidden, attn_metadata[idx_overlap].all_rank_num_tokens, idx_overlap, event_dict)
+                            mlp_fn.done_shared_experts(idx_overlap, event_dict)
+                        else:
+                            x_hidden = hidden_states[idx_overlap]
+                            x_residual = residual[idx_overlap]
+                            x_shared = None
+                        return x_hidden, x_residual, x_shared
+
+                    def _start_dispatch(idx_overlap, idx_chunk, mlp_fn=None, force_dummy=False):
+                        if mlp_fn is None:
+                            mlp_fn = self.mlp
+                        mode_params = mlp_fn.run_routed_experts(
+                            hidden_states[idx_overlap],
+                            all_rank_num_tokens=attn_metadata[idx_overlap].all_rank_num_tokens,
+                            all_rank_max_num_tokens=attn_metadata[idx_overlap].all_rank_max_num_tokens,
+                            idx_overlap=idx_chunk,
+                            idx_mode=0,
+                            idx_chunk=idx_chunk,
+                        )
+                        mode_params, hook = mlp_fn.experts.start_dispatch(mode_params, force_dummy=force_dummy)
+                        return mode_params, hook
+
+                    def _done_dispatch(hook):
+                        if hook is not None:
+                            hook()
+                        return
+
+                    def _run_routed_experts(mode_params, mlp_fn=None):
+                        if mlp_fn is None:
+                            mlp_fn = self.mlp
+                        force_dummy = mode_params["force_dummy"]
+                        if self.afd_group == AFDGroup.MOE and not force_dummy:
+                            return mlp_fn.experts.run_fused_moe(mode_params)
+                        else:
+                            return mlp_fn.experts.dummy_fused_moe(mode_params)
+
+                    def _start_combine(mode_params, mlp_fn=None):
+                        if mlp_fn is None:
+                            mlp_fn = self.mlp
+                        return mlp_fn.run_routed_experts(
+                            hidden_states[0],
+                            all_rank_num_tokens=attn_metadata[0].all_rank_num_tokens,
+                            all_rank_max_num_tokens=attn_metadata[0].all_rank_max_num_tokens,
+                            idx_overlap=0,
+                            idx_mode=2,
+                            mode_params=mode_params,
+                        )
+
+                    def _done_combine(hook):
+                        if hook is not None:
+                            hook()
+                        return
+
+                    def _finalize_moe(x_shared, x_routed, idx_overlap, layernorm_fn=None, force_dummy=False):
+                        if self.afd_group != AFDGroup.MOE and not force_dummy:
+                            x_hidden = x_shared + x_routed
+                            if layernorm_fn is None:
+                                layernorm_fn = self.next_layer_layernorm
+                            if layernorm_fn is not None:
+                                x_hidden, x_residual = layernorm_fn(x_hidden, residual[idx_overlap])
+                        else:
+                            x_hidden = hidden_states[idx_overlap]
+                            x_residual = residual[idx_overlap]
+                        return x_hidden, x_residual
+
+                    if self.afd_group == AFDGroup.ATTN_0:
+                        # Step 0
+                        if idx_layer > moe_first_layer:
+                            # Routed experts 1 in the previous layer
+                            routed_params_1 = _run_routed_experts(event_dict["routed_params_1"], mlp_fn=event_dict["mlp_fn"])
+                            # Start combine 1 in the previous layer
+                            x_routed_1, hook_combine_1 = _start_combine(routed_params_1, mlp_fn=event_dict["mlp_fn"])
+                            # Start dispatch 3 in the previous layer
+                            routed_params_3, hook_dispatch_3 = _start_dispatch(idx_overlap=0, idx_chunk=3, mlp_fn=event_dict["mlp_fn"], force_dummy=True)
+                        # Attention part 1 for chunk 0
+                        mla_params_0 = _run_attn_part_1(idx_overlap=0)
+
+                        # Step 1
+                        if idx_layer > moe_first_layer:
+                            # Done dispatch 2 in the previous layer
+                            _done_dispatch(event_dict["hook_dispatch_2"])
+                            # Routed experts 2 in the previous layer
+                            routed_params_2 = _run_routed_experts(event_dict["routed_params_2"], mlp_fn=event_dict["mlp_fn"])
+                            # Start combine 2 in the previous layer
+                            x_routed_2, hook_combine_2 = _start_combine(routed_params_2, mlp_fn=event_dict["mlp_fn"])
+                        # Attention part 2 for chunk 0
+                        hidden_states[0], residual[0], x_shared_0 = _run_attn_part_2(mla_params_0, idx_overlap=0)
+                        # Start dispatch 0
+                        routed_params_0, hook_dispatch_0 = _start_dispatch(idx_overlap=0, idx_chunk=0, force_dummy=False)
+                        if idx_layer > moe_first_layer:
+                            # Done combine 1 in the previous layer
+                            _done_combine(hook_combine_1)
+                            # Done dispatch 3 in the previous layer
+                            _done_dispatch(hook_dispatch_3)
+                            # Done combine 2 in the previous layer
+                            _done_combine(hook_combine_2)
+                            # Finalize 2 in the previous layer
+                            hidden_states[1], residual[1] = _finalize_moe(event_dict["x_shared_2"], x_routed_2, idx_overlap=1, layernorm_fn=event_dict["layernorm_fn"])
+
+                        # Step 2
+                        if idx_layer > moe_first_layer:
+                            # Routed experts 3 in the previous layer
+                            routed_params_3 = _run_routed_experts(routed_params_3, mlp_fn=event_dict["mlp_fn"])
+                            # Start combine 3 in the previous layer
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3, mlp_fn=event_dict["mlp_fn"])
+                        # Start dispatch 1
+                        routed_params_1, hook_dispatch_1 = _start_dispatch(idx_overlap=0, idx_chunk=1, force_dummy=True)
+                        # Attention part 1 for chunk 2
+                        mla_params_2 = _run_attn_part_1(idx_overlap=1)
+
+                        # Step 3
+                        # Done dispatch 0
+                        _done_dispatch(hook_dispatch_0)
+                        # Routed experts 0
+                        routed_params_0 = _run_routed_experts(routed_params_0)
+                        # Start combine 0
+                        x_routed_0, hook_combine_0 = _start_combine(routed_params_0)
+                        # Attention part 2 for chunk 2
+                        hidden_states[1], residual[1], x_shared_2 = _run_attn_part_2(mla_params_2, idx_overlap=1)
+                        # Start dispatch 2
+                        routed_params_2, hook_dispatch_2 = _start_dispatch(idx_overlap=1, idx_chunk=2, force_dummy=False)
+                        if idx_layer > moe_first_layer:
+                            # Done combine 3 in the previous layer
+                            _done_combine(hook_combine_3)
+                        # Done dispatch 1
+                        _done_dispatch(hook_dispatch_1)
+                        # Done combine 0
+                        _done_combine(hook_combine_0)
+                        # Finalize 0
+                        hidden_states[0], residual[0] = _finalize_moe(x_shared_0, x_routed_0, idx_overlap=0)
+
+                        # Terminate or prepare for the next layer
+                        if idx_layer == num_layers - 1:
+                            # Routed experts 1
+                            routed_params_1 = _run_routed_experts(routed_params_1)
+                            # Start combine 1
+                            x_routed_1, hook_combine_1 = _start_combine(routed_params_1)
+                            # Start dispatch 3
+                            routed_params_3, hook_dispatch_3 = _start_dispatch(idx_overlap=0, idx_chunk=3, force_dummy=True)
+                            # Done dispatch 2
+                            _done_dispatch(hook_dispatch_2)
+                            # Routed experts 2
+                            routed_params_2 = _run_routed_experts(routed_params_2)
+                            # Start combine 2
+                            x_routed_2, hook_combine_2 = _start_combine(routed_params_2)
+                            # Done combine 1
+                            _done_combine(hook_combine_1)
+                            # Done dispatch 3
+                            _done_dispatch(hook_dispatch_3)
+                            # Done combine 2
+                            _done_combine(hook_combine_2)
+                            # Finalize 2
+                            hidden_states[1], residual[1] = _finalize_moe(x_shared_2, x_routed_2, idx_overlap=1)
+                            # Routed experts 3
+                            routed_params_3 = _run_routed_experts(routed_params_3)
+                            # Start combine 3
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3)
+                            # Done combine 3
+                            _done_combine(hook_combine_3)
+                        else:
+                            event_dict.update({
+                                "hook_dispatch_2": hook_dispatch_2,
+                                "x_shared_2": x_shared_2,
+                                "routed_params_1": routed_params_1,
+                                "routed_params_2": routed_params_2,
+                                "layernorm_fn": self.next_layer_layernorm,
+                                "mlp_fn": self.mlp,
+                            })
+                    elif self.afd_group == AFDGroup.ATTN_1:
+                        # Step 0
+                        if idx_layer > moe_first_layer:
+                            # Routed experts 2 in the previous layer
+                            routed_params_2 = _run_routed_experts(event_dict["routed_params_2"], mlp_fn=event_dict["mlp_fn"])
+                            # Start combine 2 in the previous layer
+                            x_routed_2, hook_combine_2 = _start_combine(routed_params_2, mlp_fn=event_dict["mlp_fn"])
+                        # Start dispatch 0
+                        routed_params_0, hook_dispatch_0 = _start_dispatch(idx_overlap=0, idx_chunk=0, force_dummy=True)
+                        # Attention part 1 for chunk 1
+                        mla_params_1 = _run_attn_part_1(idx_overlap=0)
+
+                        # Step 1
+                        if idx_layer > moe_first_layer:
+                            # Done dispatch 3 in the previous layer
+                            _done_dispatch(event_dict["hook_dispatch_3"])
+                            # Routed experts 3 in the previous layer
+                            routed_params_3 = _run_routed_experts(event_dict["routed_params_3"], mlp_fn=event_dict["mlp_fn"])
+                            # Start combine 3 in the previous layer
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3, mlp_fn=event_dict["mlp_fn"])
+                        # Attention part 2 for chunk 1
+                        hidden_states[0], residual[0], x_shared_1 = _run_attn_part_2(mla_params_1, idx_overlap=0)
+                        # Start dispatch 1
+                        routed_params_1, hook_dispatch_1 = _start_dispatch(idx_overlap=0, idx_chunk=1, force_dummy=False)
+                        if idx_layer > moe_first_layer:
+                            # Done combine 2 in the previous layer
+                            _done_combine(hook_combine_2)
+                        # Done dispatch 0
+                        _done_dispatch(hook_dispatch_0)
+                        if idx_layer > moe_first_layer:
+                            # Done combine 3 in the previous layer
+                            _done_combine(hook_combine_3)
+                            # Finalize 3 in the previous layer
+                            hidden_states[1], residual[1] = _finalize_moe(event_dict["x_shared_3"], x_routed_3, idx_overlap=1, layernorm_fn=event_dict["layernorm_fn"])
+
+                        # Step 2
+                        # Routed experts 0
+                        routed_params_0 = _run_routed_experts(routed_params_0)
+                        # Start combine 0
+                        x_routed_0, hook_combine_0 = _start_combine(routed_params_0)
+                        # Start dispatch 2
+                        routed_params_2, hook_dispatch_2 = _start_dispatch(idx_overlap=0, idx_chunk=2, force_dummy=True)
+                        # Attention part 1 for chunk 3
+                        mla_params_3 = _run_attn_part_1(idx_overlap=1)
+
+                        # Step 3
+                        # Done dispatch 1
+                        _done_dispatch(hook_dispatch_1)
+                        # Routed experts 1
+                        routed_params_1 = _run_routed_experts(routed_params_1)
+                        # Start combine 1
+                        x_routed_1, hook_combine_1 = _start_combine(routed_params_1)
+                        # Attention part 2 for chunk 3
+                        hidden_states[1], residual[1], x_shared_3 = _run_attn_part_2(mla_params_3, idx_overlap=1)
+                        # Start dispatch 3
+                        routed_params_3, hook_dispatch_3 = _start_dispatch(idx_overlap=1, idx_chunk=3, force_dummy=False)
+                        # Done combine 0
+                        _done_combine(hook_combine_0)
+                        # Done dispatch 2
+                        _done_dispatch(hook_dispatch_2)
+                        # Done combine 1
                         _done_combine(hook_combine_1)
-                        _done_shared_experts(1)
-                        hidden_states[1], residual[1] = _finalize_moe(x_shared_1, x_routed_1, 1)
-                        event_dict[EventType.MainTBO].record()
-                    event_dict[EventType.MainTBO].wait()
-                else:
-                    event_dict["x_shared_1"] = x_shared_1
-                    event_dict["x_routed_1"] = x_routed_1
-                    event_dict["hook_combine_1"] = hook_combine_1
-                    event_dict["routed_params_1"] = routed_params_1
-                    event_dict["layernorm_fn_1"] = self.next_layer_layernorm
+                        # Finalize 1
+                        hidden_states[0], residual[0] = _finalize_moe(x_shared_1, x_routed_1, idx_overlap=0)
+
+                        # Terminate or prepare for the next layer
+                        if idx_layer == num_layers - 1:
+                            # Routed experts 2
+                            routed_params_2 = _run_routed_experts(routed_params_2)
+                            # Start combine 2
+                            x_routed_2, hook_combine_2 = _start_combine(routed_params_2)
+                            # Done dispatch 3
+                            _done_dispatch(hook_dispatch_3)
+                            # Routed experts 3
+                            routed_params_3 = _run_routed_experts(routed_params_3)
+                            # Start combine 3
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3)
+                            # Done combine 2
+                            _done_combine(hook_combine_2)
+                            # Done combine 3
+                            _done_combine(hook_combine_3)
+                            # Finalize 3
+                            hidden_states[1], residual[1] = _finalize_moe(x_shared_3, x_routed_3, idx_overlap=1)
+                        else:
+                            event_dict.update({
+                                "hook_dispatch_3": hook_dispatch_3,
+                                "x_shared_3": x_shared_3,
+                                "routed_params_2": routed_params_2,
+                                "routed_params_3": routed_params_3,
+                                "layernorm_fn": self.next_layer_layernorm,
+                                "mlp_fn": self.mlp,
+                            })
+                    elif self.afd_group == AFDGroup.MOE:
+                        # Step 0
+                        # Start combine 2 in the previous layer
+                        if idx_layer > moe_first_layer:
+                            x_routed_2, hook_combine_2 = _start_combine(event_dict["routed_params_2"], mlp_fn=event_dict["mlp_fn"])
+                        # Start dispatch 0
+                        routed_params_0, hook_dispatch_0 = _start_dispatch(idx_overlap=0, idx_chunk=0, force_dummy=False)
+                        # Routed experts 3 in the previous layer
+                        if idx_layer > moe_first_layer:
+                            routed_params_3 = _run_routed_experts(event_dict["routed_params_3"], mlp_fn=event_dict["mlp_fn"])
+                        # Done combine 2 in the previous layer
+                        if idx_layer > moe_first_layer:
+                            _done_combine(hook_combine_2)
+                        # Done dispatch 0
+                        _done_dispatch(hook_dispatch_0)
+
+                        # Step 1
+                        # Start combine 3 in the previous layer
+                        if idx_layer > moe_first_layer:
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3, mlp_fn=event_dict["mlp_fn"])
+                        # Start dispatch 1
+                        routed_params_1, hook_dispatch_1 = _start_dispatch(idx_overlap=0, idx_chunk=1, force_dummy=False)
+                        # Routed experts 0
+                        routed_params_0 = _run_routed_experts(routed_params_0)
+                        # Done combine 3 in the previous layer
+                        if idx_layer > moe_first_layer:
+                            _done_combine(hook_combine_3)
+                        # Done dispatch 1
+                        _done_dispatch(hook_dispatch_1)
+
+                        # Step 2
+                        # Start combine 0
+                        x_routed_0, hook_combine_0 = _start_combine(routed_params_0)
+                        # Start dispatch 2
+                        routed_params_2, hook_dispatch_2 = _start_dispatch(idx_overlap=0, idx_chunk=2, force_dummy=False)
+                        # Routed experts 1
+                        routed_params_1 = _run_routed_experts(routed_params_1)
+                        # Done combine 0
+                        _done_combine(hook_combine_0)
+                        # Done dispatch 2
+                        _done_dispatch(hook_dispatch_2)
+
+                        # Step 3
+                        # Start combine 1
+                        x_routed_1, hook_combine_1 = _start_combine(routed_params_1)
+                        # Start dispatch 3
+                        routed_params_3, hook_dispatch_3 = _start_dispatch(idx_overlap=0, idx_chunk=3, force_dummy=False)
+                        # Routed experts 2
+                        routed_params_2 = _run_routed_experts(routed_params_2)
+                        # Done combine 1
+                        _done_combine(hook_combine_1)
+                        # Done dispatch 3
+                        _done_dispatch(hook_dispatch_3)
+
+                        # Terminate or prepare for the next layer
+                        if idx_layer == num_layers - 1:
+                            # Step 0
+                            # Start combine 2
+                            x_routed_2, hook_combine_2 = _start_combine(routed_params_2)
+                            # Routed experts 3
+                            routed_params_3 = _run_routed_experts(routed_params_3)
+                            # Done combine 2
+                            _done_combine(hook_combine_2)
+
+                            # Step 1
+                            # Start combine 3
+                            x_routed_3, hook_combine_3 = _start_combine(routed_params_3)
+                            # Done combine 3
+                            _done_combine(hook_combine_3)
+                        else:
+                            event_dict.update({
+                                "routed_params_2": routed_params_2,
+                                "routed_params_3": routed_params_3,
+                                "mlp_fn": self.mlp,
+                            })
+                    else:
+                        raise ValueError(f"Invalid AFD group: {self.afd_group}")
+
+                    # # Attention part 1 for chunk 0
+                    # mla_params_0 = _run_attn_part_1(idx_overlap=0)
+                    # # Attention part 2 for chunk 0
+                    # hidden_states[0], residual[0], x_shared_0 = _run_attn_part_2(mla_params_0, idx_overlap=0)
+                    # # Start dispatch 0
+                    # routed_params_0, hook_dispatch_0 = _start_dispatch(idx_overlap=0, idx_chunk=0, force_dummy=False)
+                    # # Done dispatch 0
+                    # _done_dispatch(hook_dispatch_0)
+                    # # Attention part 1 for chunk 1
+                    # mla_params_1 = _run_attn_part_1(idx_overlap=1)
+                    # # Attention part 2 for chunk 1
+                    # hidden_states[1], residual[1], x_shared_1 = _run_attn_part_2(mla_params_1, idx_overlap=1)
+                    # # Start dispatch 1
+                    # routed_params_1, hook_dispatch_1 = _start_dispatch(idx_overlap=1, idx_chunk=1, force_dummy=False)
+                    # # Done dispatch 1
+                    # _done_dispatch(hook_dispatch_1)
+                    # # Routed experts 0
+                    # routed_params_0 = _run_routed_experts(routed_params_0)
+                    # # Start combine 0
+                    # x_routed_0, hook_combine_0 = _start_combine(routed_params_0)
+                    # # Done combine 0
+                    # _done_combine(hook_combine_0)
+                    # # Finalize 0
+                    # hidden_states[0], residual[0] = _finalize_moe(x_shared_0, x_routed_0, idx_overlap=0)
+                    # # Routed experts 1
+                    # routed_params_1 = _run_routed_experts(routed_params_1)
+                    # # Start combine 1
+                    # x_routed_1, hook_combine_1 = _start_combine(routed_params_1)
+                    # # Done combine 1
+                    # _done_combine(hook_combine_1)
+                    # # Finalize 1
+                    # hidden_states[1], residual[1] = _finalize_moe(x_shared_1, x_routed_1, idx_overlap=1)
+
             return hidden_states, residual
 
     def forward_MoE(

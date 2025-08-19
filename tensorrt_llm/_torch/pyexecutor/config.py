@@ -47,6 +47,9 @@ class PyTorchConfig:
     moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
     # If true, enable two batch overlap.
     enable_two_batch_overlap: bool = False
+    enable_afd: bool = False
+    afd_attn_size: Optional[int] = None
+    afd_moe_size: Optional[int] = None
 
     attention_dp_enable_balance: bool = False
     attention_dp_time_out_iters: int = 50

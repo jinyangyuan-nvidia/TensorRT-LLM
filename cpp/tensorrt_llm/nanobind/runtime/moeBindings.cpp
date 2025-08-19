@@ -94,7 +94,7 @@ void initMoeBindings(nb::module_& m)
 
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
-        .def(nb::init<int, int, int>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
+        .def(nb::init<int, int, int, bool, int, int>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"), nb::arg("afd_enabled"), nb::arg("afd_attn_size"), nb::arg("afd_moe_size"),
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates")

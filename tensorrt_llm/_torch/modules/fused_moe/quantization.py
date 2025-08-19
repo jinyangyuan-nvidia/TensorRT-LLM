@@ -166,16 +166,17 @@ class FusedMoEMethodBase(ABC):
         bias_dtype: Optional[torch.dtype] = None,
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
+        no_weight: bool = False,
     ):
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype),
+                                                dtype=weight_dtype, device="meta" if no_weight else None),
                                     requires_grad=False)
         module.register_parameter("w3_w1_weight", w3_w1_weight)
 
         # down_proj (row parallel)
         w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype),
+                                             dtype=weight_dtype, device="meta" if no_weight else None),
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
@@ -251,7 +252,10 @@ class FusedMoEMethodBase(ABC):
                                            dst_w2_bias_tensor.data[expert_idx])
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+                     weight_loading_mode: MoEWeightLoadingMode, no_weight: bool = False):
+
+        if no_weight:
+            return
 
         self.load_expert_weights_to_dst(
             module, weights, weight_loading_mode,
@@ -593,7 +597,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module, no_weight: bool = False):
         weight_dtype = torch.float8_e4m3fn
 
         w3_w1_weight_shape = (module.expert_size_per_partition,
@@ -605,7 +609,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             module.intermediate_size_per_partition,
         )
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+                               w2_weight_shape, no_weight)
 
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
@@ -628,8 +632,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         self.setup_quant_scales(module)
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
-        super().load_weights(module, weights, weight_loading_mode)
+                     weight_loading_mode: MoEWeightLoadingMode, no_weight: bool = False):
+        super().load_weights(module, weights, weight_loading_mode, no_weight)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
@@ -773,7 +777,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module, no_weight: bool = False):
         module.sm_version = get_sm_version()
         if module.sm_version == 89:
             module.interleave = [1, 1]
@@ -845,7 +849,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         module.register_parameter("fc2_alpha", fc2_alpha)
 
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+                               w2_weight_shape, no_weight)
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):

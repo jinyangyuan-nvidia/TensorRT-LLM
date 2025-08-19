@@ -86,6 +86,18 @@ class Distributed(ABC):
     def cp_config(self):
         return self.mapping.cp_config
 
+    @property
+    def enable_afd(self):
+        return self.mapping.enable_afd
+
+    @property
+    def afd_attn_size(self):
+        return self.mapping.afd_attn_size
+    
+    @property
+    def afd_moe_size(self):
+        return self.mapping.afd_moe_size
+
     @abstractmethod
     def broadcast(self, obj, root=0):
         pass

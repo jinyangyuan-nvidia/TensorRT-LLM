@@ -122,6 +122,12 @@ def add_llm_args(parser):
     parser.add_argument('--enable_two_batch_overlap',
                         default=False,
                         action='store_true')
+    parser.add_argument('--enable_afd',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--afd_attn_size', type=int, default=None)
+    parser.add_argument('--afd_moe_size', type=int, default=None)
+    parser.add_argument('--mode_load_balancer', type=str, default=None)
     parser.add_argument('--attention_dp_enable_balance',
                         default=False,
                         action='store_true')
@@ -290,13 +296,19 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend, max_num_tokens=128 * args.tp_size),
+        moe_config=MoeConfig(
+            backend=args.moe_backend,
+            max_num_tokens=128 * args.tp_size,
+            load_balancer=args.mode_load_balancer),
         use_torch_sampler=args.use_torch_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
         enable_attention_dp=args.enable_attention_dp,
         enable_two_batch_overlap=args.enable_two_batch_overlap,
+        enable_afd=args.enable_afd,
+        afd_attn_size=args.afd_attn_size,
+        afd_moe_size=args.afd_moe_size,
         attention_dp_config=attention_dp_config,
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,

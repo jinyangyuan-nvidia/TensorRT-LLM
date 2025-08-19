@@ -255,7 +255,7 @@ private:
 class MoeLoadBalancer
 {
 public:
-    MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter);
+    MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool afdEnabled, int afdAttnSize, int afdMoeSize);
     ~MoeLoadBalancer();
 
     // Add a new layer to the load balancer
@@ -338,6 +338,11 @@ private:
     void generateUpdatePlan();
 
     bool mUseGpuMemcpy = false;
+
+    // AFD Info
+    bool mAfdEnabled = false;
+    int mAfdAttnSize = 0;
+    int mAfdMoeSize = 0;
 };
 
 // functions exposed for testing

@@ -31,22 +31,42 @@ class MoeLoadBalancerConfig:
     ep_rank: Optional[int] = field(default=None, init=False)
     ep_size: Optional[int] = field(default=None, init=False)
 
-    def setup(self, ep_rank: int, ep_size: int) -> None:
+    afd_enabled: Optional[bool] = field(default=None, init=False)
+    afd_attn_size: Optional[int] = field(default=None, init=False)
+    afd_moe_size: Optional[int] = field(default=None, init=False)
+
+    def setup(self, ep_rank: int, ep_size: int, afd_enabled: bool, afd_attn_size: int, afd_moe_size: int) -> None:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
+        self.afd_enabled = afd_enabled
+        self.afd_attn_size = afd_attn_size
+        self.afd_moe_size = afd_moe_size
         assert self.num_slots is not None
 
     @property
     def num_local_slots(self) -> int:
-        return self.num_slots // self.ep_size
+        moe_size = self.afd_moe_size if self.afd_enabled else self.ep_size
+        return self.num_slots // moe_size
 
     @property
     def slot_start(self) -> int:
-        return self.ep_rank * self.num_local_slots
+        if self.afd_enabled:
+            moe_offset = self.afd_attn_size * 2
+            if self.ep_rank >= moe_offset:
+                slot_start = (self.ep_rank - moe_offset) * self.num_local_slots
+            else:
+                slot_start = self.num_slots
+        else:
+            slot_start = self.ep_rank * self.num_local_slots
+        return slot_start
 
     @property
     def slot_end(self) -> int:
-        return self.slot_start + self.num_local_slots
+        if self.afd_enabled:
+            slot_end = self.slot_start + self.num_local_slots
+        else:
+            slot_end = self.num_slots
+        return slot_end
 
     def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
         if self.initial_global_assignments is not None:
@@ -82,6 +102,9 @@ class ModelConfig(Generic[TConfig]):
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     enable_two_batch_overlap: bool = False
+    enable_afd: bool = False
+    afd_attn_size: Optional[int] = None
+    afd_moe_size: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM

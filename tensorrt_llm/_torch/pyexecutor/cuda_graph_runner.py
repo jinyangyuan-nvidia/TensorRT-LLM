@@ -38,6 +38,7 @@ class DecodingCUDAGraphRunner:
         max_beam_width: int = 1,
         attn_metadata_overlap_0: Optional[AttentionMetadata] = None,
         attn_metadata_overlap_1: Optional[AttentionMetadata] = None,
+        disable_prepare: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -54,6 +55,7 @@ class DecodingCUDAGraphRunner:
         """
         self.batch_size = batch_size
         self.max_beam_width = max_beam_width
+        self.disable_prepare = disable_prepare
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
@@ -182,52 +184,53 @@ class DecodingCUDAGraphRunner:
                 "attn_metadata_overlap_1 does not match the attn_metadata_overlap_1 instance that was used to "
                 "capture this graph.")
 
-            if not is_capture:
-                assert len(attn_metadata.request_ids) == len(attn_metadata.prompt_lens)
-                assert input_ids.shape[0] == position_ids.shape[1]
-                split_request = (len(attn_metadata.request_ids) + 1) // 2
-                split_context = (attn_metadata.num_contexts + 1) // 2
-                assert len(attn_metadata.kv_cache_params.num_cached_tokens_per_seq) % len(attn_metadata.request_ids) == 0
-                unit_cached_tokens = len(attn_metadata.kv_cache_params.num_cached_tokens_per_seq) // len(attn_metadata.request_ids)
-                split_cached_tokens = split_request * unit_cached_tokens
-                assert input_ids.shape[0] % len(attn_metadata.request_ids) == 0
-                unit_input = input_ids.shape[0] // len(attn_metadata.request_ids)
-                split_input = split_request * unit_input
-                self.attn_metadata_overlap_0.beam_width = attn_metadata.beam_width
-                self.attn_metadata_overlap_1.beam_width = attn_metadata.beam_width
-                self.attn_metadata_overlap_0.request_ids = attn_metadata.request_ids[:split_request]
-                self.attn_metadata_overlap_1.request_ids = attn_metadata.request_ids[split_request:]
-                self.attn_metadata_overlap_0.prompt_lens = attn_metadata.prompt_lens[:split_request]
-                self.attn_metadata_overlap_1.prompt_lens = attn_metadata.prompt_lens[split_request:]
-                self.attn_metadata_overlap_0.num_contexts = split_context
-                self.attn_metadata_overlap_1.num_contexts = attn_metadata.num_contexts - split_context
-                self.attn_metadata_overlap_0.kv_cache_params = KVCacheParams(
-                    use_cache=attn_metadata.kv_cache_params.use_cache,
-                    block_ids_per_seq=attn_metadata.kv_cache_params.block_ids_per_seq,
-                    num_cached_tokens_per_seq=attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:split_cached_tokens])
-                self.attn_metadata_overlap_1.kv_cache_params = KVCacheParams(
-                    use_cache=attn_metadata.kv_cache_params.use_cache,
-                    block_ids_per_seq=attn_metadata.kv_cache_params.block_ids_per_seq,
-                    num_cached_tokens_per_seq=attn_metadata.kv_cache_params.num_cached_tokens_per_seq[split_cached_tokens:])
-                self.attn_metadata_overlap_0.kv_cache_manager = attn_metadata.kv_cache_manager
-                self.attn_metadata_overlap_1.kv_cache_manager = attn_metadata.kv_cache_manager
-                self.attn_metadata_overlap_0.prepare()
-                self.attn_metadata_overlap_1.prepare()
-                input_ids_overlap_0 = input_ids[:split_input]
-                input_ids_overlap_1 = input_ids[split_input:]
-                position_ids_overlap_0 = position_ids[:, :split_input]
-                position_ids_overlap_1 = position_ids[:, split_input:]
-            else:
-                input_ids_overlap_0 = inputs["input_ids_overlap_0"]
-                input_ids_overlap_1 = inputs["input_ids_overlap_1"]
-                position_ids_overlap_0 = inputs["position_ids_overlap_0"]
-                position_ids_overlap_1 = inputs["position_ids_overlap_1"]
-            seqlen_overlap_0 = input_ids_overlap_0.shape[0]
-            seqlen_overlap_1 = input_ids_overlap_1.shape[0]
-            self.input_ids_overlap_0[:seqlen_overlap_0].copy_(input_ids_overlap_0)
-            self.input_ids_overlap_1[:seqlen_overlap_1].copy_(input_ids_overlap_1)
-            self.position_ids_overlap_0[:, :seqlen_overlap_0].copy_(position_ids_overlap_0)
-            self.position_ids_overlap_1[:, :seqlen_overlap_1].copy_(position_ids_overlap_1)
+            if not self.disable_prepare:
+                if not is_capture:
+                    assert len(attn_metadata.request_ids) == len(attn_metadata.prompt_lens)
+                    assert input_ids.shape[0] == position_ids.shape[1]
+                    split_request = (len(attn_metadata.request_ids) + 1) // 2
+                    split_context = (attn_metadata.num_contexts + 1) // 2
+                    assert len(attn_metadata.kv_cache_params.num_cached_tokens_per_seq) % len(attn_metadata.request_ids) == 0
+                    unit_cached_tokens = len(attn_metadata.kv_cache_params.num_cached_tokens_per_seq) // len(attn_metadata.request_ids)
+                    split_cached_tokens = split_request * unit_cached_tokens
+                    assert input_ids.shape[0] % len(attn_metadata.request_ids) == 0
+                    unit_input = input_ids.shape[0] // len(attn_metadata.request_ids)
+                    split_input = split_request * unit_input
+                    self.attn_metadata_overlap_0.beam_width = attn_metadata.beam_width
+                    self.attn_metadata_overlap_1.beam_width = attn_metadata.beam_width
+                    self.attn_metadata_overlap_0.request_ids = attn_metadata.request_ids[:split_request]
+                    self.attn_metadata_overlap_1.request_ids = attn_metadata.request_ids[split_request:]
+                    self.attn_metadata_overlap_0.prompt_lens = attn_metadata.prompt_lens[:split_request]
+                    self.attn_metadata_overlap_1.prompt_lens = attn_metadata.prompt_lens[split_request:]
+                    self.attn_metadata_overlap_0.num_contexts = split_context
+                    self.attn_metadata_overlap_1.num_contexts = attn_metadata.num_contexts - split_context
+                    self.attn_metadata_overlap_0.kv_cache_params = KVCacheParams(
+                        use_cache=attn_metadata.kv_cache_params.use_cache,
+                        block_ids_per_seq=attn_metadata.kv_cache_params.block_ids_per_seq,
+                        num_cached_tokens_per_seq=attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:split_cached_tokens])
+                    self.attn_metadata_overlap_1.kv_cache_params = KVCacheParams(
+                        use_cache=attn_metadata.kv_cache_params.use_cache,
+                        block_ids_per_seq=attn_metadata.kv_cache_params.block_ids_per_seq,
+                        num_cached_tokens_per_seq=attn_metadata.kv_cache_params.num_cached_tokens_per_seq[split_cached_tokens:])
+                    self.attn_metadata_overlap_0.kv_cache_manager = attn_metadata.kv_cache_manager
+                    self.attn_metadata_overlap_1.kv_cache_manager = attn_metadata.kv_cache_manager
+                    self.attn_metadata_overlap_0.prepare()
+                    self.attn_metadata_overlap_1.prepare()
+                    input_ids_overlap_0 = input_ids[:split_input]
+                    input_ids_overlap_1 = input_ids[split_input:]
+                    position_ids_overlap_0 = position_ids[:, :split_input]
+                    position_ids_overlap_1 = position_ids[:, split_input:]
+                else:
+                    input_ids_overlap_0 = inputs["input_ids_overlap_0"]
+                    input_ids_overlap_1 = inputs["input_ids_overlap_1"]
+                    position_ids_overlap_0 = inputs["position_ids_overlap_0"]
+                    position_ids_overlap_1 = inputs["position_ids_overlap_1"]
+                seqlen_overlap_0 = input_ids_overlap_0.shape[0]
+                seqlen_overlap_1 = input_ids_overlap_1.shape[0]
+                self.input_ids_overlap_0[:seqlen_overlap_0].copy_(input_ids_overlap_0)
+                self.input_ids_overlap_1[:seqlen_overlap_1].copy_(input_ids_overlap_1)
+                self.position_ids_overlap_0[:, :seqlen_overlap_0].copy_(position_ids_overlap_0)
+                self.position_ids_overlap_1[:, :seqlen_overlap_1].copy_(position_ids_overlap_1)
             inputs.update({
                 "input_ids_overlap_0": self.input_ids_overlap_0,
                 "input_ids_overlap_1": self.input_ids_overlap_1,

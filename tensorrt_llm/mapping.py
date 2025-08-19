@@ -129,7 +129,10 @@ class Mapping(object):
             attn_tp_size=-1,
             attn_cp_size=-1,
             auto_parallel=False,
-            enable_attention_dp=False):
+            enable_attention_dp=False,
+            enable_afd=False,
+            afd_attn_size=None,
+            afd_moe_size=None):
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
         if moe_cluster_size == -1:
@@ -260,6 +263,16 @@ class Mapping(object):
                         j * moe_cluster_size * moe_ep_size +
                         (k + 1) * moe_ep_size)
                     self.moe_ep_groups.append(list(ranks))
+
+        # AFD
+        self.enable_afd = enable_afd
+        self.afd_attn_size = afd_attn_size
+        self.afd_moe_size = afd_moe_size
+        if enable_afd:
+            assert self.afd_attn_size is not None and self.afd_moe_size is not None
+            assert self.afd_attn_size * 2 + self.afd_moe_size == self.world_size
+        else:
+            assert self.afd_attn_size is None and self.afd_moe_size is None
 
     def __eq__(self, other):
         if not isinstance(other, Mapping):

@@ -58,7 +58,8 @@ void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float
     MoePlacementCpuInfo* cpuPlacement)
 {
     cpuPlacement->expertReplicaCount.resize(metaInfo.expertCount);
-    int totalSlotCount = metaInfo.epSize * metaInfo.slotCountPerRank;
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    int totalSlotCount = moeSize * metaInfo.slotCountPerRank;
     // --- Edge Case 1: No replication needed ---
     if (totalSlotCount == metaInfo.expertCount)
     {
@@ -128,7 +129,9 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     auto& rankExpertIds = cpuPlacement->rankExpertIds;
     auto& replicaCount = cpuPlacement->expertReplicaCount;
 
-    int totalSlotCount = metaInfo.epSize * metaInfo.slotCountPerRank;
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    int moeOffset = metaInfo.afdEnabled ? metaInfo.afdAttnSize * 2 : 0;
+    int totalSlotCount = moeSize * metaInfo.slotCountPerRank;
     // 1. Create all replica information
     std::vector<ReplicaInfo> allReplicas;
     allReplicas.reserve(totalSlotCount);
@@ -158,7 +161,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     std::priority_queue<RankLoadPair, std::vector<RankLoadPair>, std::greater<RankLoadPair>> pq;
 
     // Initialize the priority queue with all ranks having 0 load
-    for (int rank = 0; rank < metaInfo.epSize; ++rank)
+    for (int rank = moeOffset; rank < moeOffset + moeSize; ++rank)
     {
         pq.push({0.0, rank});
     }
@@ -211,7 +214,8 @@ void printMoePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInf
     }
     ss << "]\n";
     ss << "globalSlotIds: [";
-    for (int i = 0; i < metaInfo.epSize * metaInfo.slotCountPerRank; ++i)
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    for (int i = 0; i < moeSize * metaInfo.slotCountPerRank; ++i)
     {
         ss << cpuPlacement->globalSlotIds[i] << ", ";
     }
@@ -221,7 +225,9 @@ void printMoePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInf
 void printCpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, MoePlacementCpuInfo* cpuPlacement)
 {
     std::stringstream ss;
-    for (int rank = 0; rank < metaInfo.epSize; ++rank)
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    int moeOffset = metaInfo.afdEnabled ? metaInfo.afdAttnSize * 2 : 0;
+    for (int rank = moeOffset; rank < moeOffset + moeSize; ++rank)
     {
         ss << "rank=" << rank << " expertIds: [";
         for (int slotId = 0; slotId < metaInfo.slotCountPerRank; ++slotId)
@@ -253,7 +259,9 @@ void prepareGpuPlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaI
     // different experts have different number of replicas, so globalSlotIds is a vector of vectors
     // the sum of sizes of all vectors in globalSlotIds is equal to the total number of slots
     std::vector<std::vector<int>> globalSlotIds(metaInfo.expertCount);
-    for (int rank = 0; rank < metaInfo.epSize; ++rank)
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    int moeOffset = metaInfo.afdEnabled ? metaInfo.afdAttnSize * 2 : 0;
+    for (int rank = moeOffset; rank < moeOffset + moeSize; ++rank)
     {
         for (int slotId = 0; slotId < metaInfo.slotCountPerRank; ++slotId)
         {
@@ -411,11 +419,13 @@ void SingleLayerMoeLoadBalancer::addSingleHostWeight(int expertId, std::string c
 void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments)
 {
     std::fill_n(mCpuPlacementInfo.expertReplicaCount.begin(), mMetaInfo.expertCount, 0);
-    for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
+    int moeSize = mMetaInfo.afdEnabled ? mMetaInfo.afdMoeSize : mMetaInfo.epSize;
+    int moeOffset = mMetaInfo.afdEnabled ? mMetaInfo.afdAttnSize * 2 : 0;
+    for (int rank = moeOffset; rank < moeOffset + moeSize; ++rank)
     {
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
-            int expertId = initialWeightAssignments[rank * mMetaInfo.slotCountPerRank + localSlotId];
+            int expertId = initialWeightAssignments[(rank - moeOffset) * mMetaInfo.slotCountPerRank + localSlotId];
             TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
             mCpuPlacementInfo.expertReplicaCount[expertId]++;
@@ -782,7 +792,8 @@ void PrintUpdateInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo,
 {
     std::stringstream ss;
     ss << "[UpdateInfo] rank=" << metaInfo.epRank << ", expert weights=\n    [";
-    for (int slotId = 0; slotId < metaInfo.slotCountPerRank * metaInfo.epSize; slotId++)
+    int moeSize = metaInfo.afdEnabled ? metaInfo.afdMoeSize : metaInfo.epSize;
+    for (int slotId = 0; slotId < metaInfo.slotCountPerRank * moeSize; slotId++)
     {
         ss << placementCpuInfo->rankExpertIds[slotId / metaInfo.slotCountPerRank][slotId % metaInfo.slotCountPerRank]
            << ", ";
@@ -800,10 +811,17 @@ void HostMemoryMoeWeightUpdater::updateWeights(
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
-        TLLM_CHECK_WITH_INFO(oldExpertId >= 0 && oldExpertId < mMetaInfo.expertCount,
-            "oldExpertId=%d, should in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
-        TLLM_CHECK_WITH_INFO(newExpertId >= 0 && newExpertId < mMetaInfo.expertCount,
-            "newExpertId=%d, should in range [0, %d)", newExpertId, mMetaInfo.expertCount);
+        if (oldExpertId == -1)
+        {
+            TLLM_CHECK_WITH_INFO(newExpertId == -1, "newExpertId=%d, should be -1", newExpertId);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(oldExpertId >= 0 && oldExpertId < mMetaInfo.expertCount,
+                "oldExpertId=%d, should in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
+            TLLM_CHECK_WITH_INFO(newExpertId >= 0 && newExpertId < mMetaInfo.expertCount,
+                "newExpertId=%d, should in range [0, %d)", newExpertId, mMetaInfo.expertCount);
+        }
         if (oldExpertId == newExpertId)
         {
             continue;
@@ -829,10 +847,13 @@ void HostMemoryMoeWeightUpdater::updateWeights(
 // Moe Load Balancer
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter)
+MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool afdEnabled, int afdAttnSize, int afdMoeSize)
     : mEpRank{epRank}
     , mEpSize{epSize}
     , mLayerUpdatesPerIter{layerUpdatesPerIter}
+    , mAfdEnabled{afdEnabled}
+    , mAfdAttnSize{afdAttnSize}
+    , mAfdMoeSize{afdMoeSize}
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mCudaDeviceId));
     // create a non-blocking stream for compute and update, not needed anymore for CPU copy engine.
@@ -884,7 +905,7 @@ std::shared_ptr<SingleLayerMoeLoadBalancer> MoeLoadBalancer::AddLayer(int expert
 {
     TLLM_CHECK_WITH_INFO(mModelFinalized == false, "Model is finalized, cannot add new layer.");
     auto layer = std::make_shared<SingleLayerMoeLoadBalancer>(
-        tensorrt_llm::kernels::MoeLoadBalanceMetaInfo{expertCount, topK, mEpRank, mEpSize, slotCountPerRank}, this,
+        tensorrt_llm::kernels::MoeLoadBalanceMetaInfo{expertCount, topK, mEpRank, mEpSize, slotCountPerRank, mAfdEnabled, mAfdAttnSize, mAfdMoeSize}, this,
         mLayers.size());
     layer->createResources();
     mLayers.push_back(layer);

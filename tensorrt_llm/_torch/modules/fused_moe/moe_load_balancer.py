@@ -318,6 +318,7 @@ class SingleLayerMoeLoadBalancer:
         else:
             self.aux_stream = None
             self.event_dict = None
+        self.disable_statistic = False
 
         self.statistic_flag_tensor = None
         self.local_statistic_tensor = None
@@ -628,7 +629,7 @@ class SingleLayerMoeLoadBalancer:
 
         def _update_statistic():
             if is_last_stage:
-                global_statistic_info = allreduce(self.local_statistic_tensor)
+                global_statistic_info = allreduce(torch.zeros_like(self.local_statistic_tensor) if self.disable_statistic else self.local_statistic_tensor)
                 torch.ops.trtllm.moe_hierarchical_statistic_update(
                     global_statistic_info, self.statistic_flag_tensor,
                     self.single_layer_load_balancer_ptr)
@@ -722,7 +723,10 @@ class MoeLoadBalancer:
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: str = 'moe_shared'):
+                 shared_memory_base_name: str = 'moe_shared',
+                 afd_enabled: bool = False,
+                 afd_attn_size: int = 0,
+                 afd_moe_size: int = 0):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -737,7 +741,7 @@ class MoeLoadBalancer:
         self.ep_size = ep_size
         self.layer_updates_per_iter = layer_updates_per_iter
         self.load_balancer_impl = _tbr.MoeLoadBalancer(ep_rank, ep_size,
-                                                       layer_updates_per_iter)
+                                                       layer_updates_per_iter, afd_enabled, afd_attn_size, afd_moe_size)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name
@@ -751,6 +755,10 @@ class MoeLoadBalancer:
         self.enable_update_weights = False
 
         self.next_layer_repeated_count = None
+
+        self.afd_enabled = afd_enabled
+        self.afd_attn_size = afd_attn_size
+        self.afd_moe_size = afd_moe_size
 
     def __del__(self):
         if not self.is_shutdown:
@@ -961,7 +969,13 @@ def maybe_create_moe_load_balancer(
     using_smart_router = mapping and mapping.moe_cluster_size > 1
     moe_load_balancer = nullcontext()
     if in_supported_model_arch and using_ep and not using_smart_router and model_config.moe_load_balancer is not None:
-        model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
+        model_config.moe_load_balancer.setup(
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            afd_enabled=mapping.enable_afd,
+            afd_attn_size=mapping.afd_attn_size,
+            afd_moe_size=mapping.afd_moe_size,
+        )
         if model_config.moe_load_balancer.layer_updates_per_iter > 0:
             # TODO: remove this when supported.
             # cpu_arch = platform.machine().lower()
@@ -972,7 +986,10 @@ def maybe_create_moe_load_balancer(
             ep_rank=ep_rank,
             ep_size=ep_size,
             layer_updates_per_iter=model_config.moe_load_balancer.
-            layer_updates_per_iter)
+            layer_updates_per_iter,
+            afd_enabled=mapping.enable_afd,
+            afd_attn_size=mapping.afd_attn_size,
+            afd_moe_size=mapping.afd_moe_size)
         logger.info(
             f"Created MoE LoadBalancer, layer_updates_per_iter={model_config.moe_load_balancer.layer_updates_per_iter}..."
         )
