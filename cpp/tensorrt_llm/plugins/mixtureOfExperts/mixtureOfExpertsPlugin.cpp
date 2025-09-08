@@ -552,7 +552,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
     size_t moe_workspace_size
         = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken,
             mActivationType, mParallelismConfig, hasLora(), /*use_deepseek_fp8_block_scale=*/false,
-            /*min_latency_mode=*/false, hasExpertPrequantScales());
+            /*min_latency_mode=*/false, hasExpertPrequantScales(), /*is_offset_layout=*/true);
 
     // Permutation map
     size_t src_to_dest_map_size = mExpertsPerToken * num_tokens * sizeof(int);
@@ -961,10 +961,10 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
-        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
-        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
-        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        /*valid_tokens=*/nullptr, /*max_tokens_per_expert=*/num_tokens, inputs[getExpertWeights1Index()],
+        hasBias() ? inputs[getExpertBias1Index()] : nullptr, ActivationParams(mActivationType),
+        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
+        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
         /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
@@ -973,10 +973,10 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
-        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
-        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
-        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        /*valid_tokens=*/nullptr, /*max_tokens_per_expert=*/num_tokens, inputs[getExpertWeights1Index()],
+        hasBias() ? inputs[getExpertBias1Index()] : nullptr, ActivationParams(mActivationType),
+        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
+        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
         lora_params, /*use_deepseek_fp8_block_scale=*/false,

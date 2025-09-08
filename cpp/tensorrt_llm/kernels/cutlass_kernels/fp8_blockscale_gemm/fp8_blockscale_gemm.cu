@@ -91,6 +91,17 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
     void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n, size_t shape_k,
     cudaStream_t stream, float const* scales_a, float const* scales_b)
 {
+    std::cout << "Invalid function call of moeGemm" << std::endl;
+    return moeGemm(
+        mat_d, mat_a, mat_b, problem_m_offsets, nullptr, num_problems, 0, shape_n, shape_k, stream, scales_a, scales_b);
+}
+
+template <typename ElementA, typename ElementB, typename ElementD>
+void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void* mat_d, void const* mat_a,
+    void const* mat_b, int64_t const* problem_m_offsets, int32_t const* valid_tokens, int64_t max_tokens_per_expert,
+    size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a,
+    float const* scales_b)
+{
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
 
@@ -138,22 +149,24 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
-            max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, valid_tokens, max_tokens_per_expert,
+            num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+            internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
-            num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
-            internal_quantize_a, internal_quantize_b);
+            valid_tokens, max_tokens_per_expert, num_problems, expected_m_, max_shape_m_4_align_,
+            max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_fp8_e4m3> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(nullptr, fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
-            max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, valid_tokens, max_tokens_per_expert,
+            num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+            internal_quantize_a, internal_quantize_b);
     }
     else
     {
@@ -200,12 +213,21 @@ template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSizeBase(
     size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems)
 {
+    std::cout << "Invalid function call of getWorkspaceSizeBase" << std::endl;
+    return getWorkspaceSizeBase(max_shape_m, shape_n, shape_k, num_problems, true);
+}
+
+template <typename ElementA, typename ElementB, typename ElementD>
+size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSizeBase(
+    size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems, bool is_offset_layout)
+{
     max_shape_m_4_align_ = std::max(max_shape_m_4_align_, int64_t(div_up(max_shape_m, 4) * 4));
     if (expected_m_ == 0)
     {
         expected_m_ = div_up(max_shape_m_4_align_, num_problems);
     }
-    max_shape_m_32_align_padded_ = deep_gemm::compute_padded_offset(max_shape_m, num_problems);
+    max_shape_m_32_align_padded_
+        = is_offset_layout ? deep_gemm::compute_padded_offset(max_shape_m, num_problems) : max_shape_m;
 
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -233,8 +255,16 @@ template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSize(
     size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k, size_t num_problems)
 {
+    std::cout << "Invalid function call of getWorkspaceSize" << std::endl;
+    return getWorkspaceSize(shape_m, shape_n, shape_k, top_k, num_problems, true);
+}
+
+template <typename ElementA, typename ElementB, typename ElementD>
+size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSize(
+    size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k, size_t num_problems, bool is_offset_layout)
+{
     expected_m_ = shape_m;
-    return getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems);
+    return getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems, is_offset_layout);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>

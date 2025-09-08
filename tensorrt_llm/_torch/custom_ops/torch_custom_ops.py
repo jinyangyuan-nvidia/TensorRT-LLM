@@ -144,6 +144,7 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    valid_tokens: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -153,7 +154,7 @@ def fused_moe(
     if enable_alltoall:
         assert tuner_num_tokens is not None
         assert tuner_top_k is not None
-        tuner_input = input[:tuner_num_tokens]
+        tuner_input = input.flatten(0, -2)[:tuner_num_tokens]
     else:
         assert tuner_num_tokens is None
         assert tuner_top_k is None
@@ -208,6 +209,7 @@ def fused_moe(
         input,
         token_selected_experts,
         token_final_scales,
+        valid_tokens,
         fc1_expert_weights,
         fc1_expert_biases,
         fc2_expert_weights,

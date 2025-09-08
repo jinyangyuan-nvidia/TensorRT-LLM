@@ -95,6 +95,43 @@ def change_to_offset_layout(
     return ret_x, ret_x_scale
 
 
+def change_to_mask_layout(
+    ms: List[int],
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_list = []
+    x_scale_list = []
+    num_problems = len(ms)
+    m_acc = [0] + list(itertools.accumulate(ms))
+    max_tokens_per_expert = (max(ms) * 2 + 31) // 32 * 32
+    for i in range(num_problems):
+        x_sel = x_fp8[m_acc[i]:m_acc[i + 1]]
+        x_scale_sel = x_scale[m_acc[i]:m_acc[i + 1]]
+        x_sel = torch.cat([
+            x_sel,
+            torch.empty(
+                (max_tokens_per_expert - x_sel.shape[0], *x_sel.shape[1:]),
+                dtype=x_sel.dtype,
+                device=x_sel.device,
+            ),
+        ])
+        x_scale_sel = torch.cat([
+            x_scale_sel,
+            torch.empty(
+                (max_tokens_per_expert - x_scale_sel.shape[0],
+                 *x_scale_sel.shape[1:]),
+                dtype=x_scale_sel.dtype,
+                device=x_scale_sel.device,
+            ),
+        ])
+        x_list.append(x_sel)
+        x_scale_list.append(x_scale_sel)
+    ret_x = torch.stack(x_list)
+    ret_x_scale = torch.cat(x_scale_list).t().contiguous()
+    return ret_x, ret_x_scale
+
+
 def construct_grouped(
     ms: List[int], k: int, n: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
@@ -177,9 +214,16 @@ def test_fp8_block_scaling_moe_gemm(ms, k, n):
     offset_cpu = [0] + list(itertools.accumulate(ms))
     offset = torch.tensor(offset_cpu, device='cuda', dtype=torch.int64)
     x_fp8, x_scale, y_fp8, y_scale, ref_out = construct_grouped(ms, k, n)
-    x_fp8, x_scale = change_to_offset_layout(ms, x_fp8, x_scale)
+    # x_fp8, x_scale = change_to_offset_layout(ms, x_fp8, x_scale)
+    x_fp8, x_scale = change_to_mask_layout(ms, x_fp8, x_scale)
+    valid_tokens = (offset[1:] - offset[:-1]).to(torch.int32)
     out = torch.ops.trtllm.fp8_block_scaling_moe_gemm(x_fp8, y_fp8, x_scale,
-                                                      y_scale, offset)
+                                                      y_scale, offset * 0,
+                                                      valid_tokens)
+    out_list = [*out.chunk(out.shape[0], dim=0)]
+    for idx, out_sel in enumerate(out_list):
+        out_list[idx] = out_sel.squeeze(0)[:ms[idx]]
+    out = torch.cat(out_list, dim=0)
     diff = calc_diff(out, ref_out)
     assert diff < 1e-3
     torch.testing.assert_close(out, ref_out, atol=1e-3, rtol=1e-3)

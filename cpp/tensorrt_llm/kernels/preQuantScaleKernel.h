@@ -39,5 +39,10 @@ template <typename T_in, typename T_out = T_in>
 void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale,
     int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr, cudaStream_t stream = 0);
 
+template <typename T_in, typename T_out = T_in>
+void apply_per_channel_scale_low_latency_kernel_launcher(T_out* smoothed_act, T_in const* act,
+    T_in const* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr,
+    int32_t const* valid_tokens = nullptr, int64_t max_tokens_per_expert = 0, cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace tensorrt_llm

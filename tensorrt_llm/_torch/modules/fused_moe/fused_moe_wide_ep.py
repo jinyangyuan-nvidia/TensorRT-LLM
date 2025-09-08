@@ -458,6 +458,7 @@ class WideEPMoE(MoE):
         else:
             tuner_num_tokens = None
             tuner_top_k = None
+        recv_expert_count = None
         if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
@@ -498,25 +499,25 @@ class WideEPMoE(MoE):
                     # x shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
-                    # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
-                    # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
-                    mask = torch.arange(
-                        x.shape[1], dtype=torch.int32, device=x.device).expand(
-                            x.shape[0],
-                            x.shape[1]) < recv_expert_count.unsqueeze(1)
-                    token_selected_slots = torch.where(
-                        mask,
-                        torch.arange(
-                            x.shape[0] * self.mapping.moe_ep_rank,
-                            x.shape[0] * (self.mapping.moe_ep_rank + 1),
-                            dtype=torch.int32,
-                            device=x.device).unsqueeze(1), self.num_slots)
-                    x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-                    # Cheat the fused_moe API with fake top_k=1
-                    token_selected_slots = token_selected_slots.view(
-                        x.shape[0], 1)
-                    token_final_scales = torch.ones_like(
-                        token_selected_slots, dtype=token_final_scales.dtype)
+                    # # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
+                    # # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+                    # mask = torch.arange(
+                    #     x.shape[1], dtype=torch.int32, device=x.device).expand(
+                    #         x.shape[0],
+                    #         x.shape[1]) < recv_expert_count.unsqueeze(1)
+                    # token_selected_slots = torch.where(
+                    #     mask,
+                    #     torch.arange(
+                    #         x.shape[0] * self.mapping.moe_ep_rank,
+                    #         x.shape[0] * (self.mapping.moe_ep_rank + 1),
+                    #         dtype=torch.int32,
+                    #         device=x.device).unsqueeze(1), self.num_slots)
+                    # x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                    # # Cheat the fused_moe API with fake top_k=1
+                    # token_selected_slots = token_selected_slots.view(
+                    #     x.shape[0], 1)
+                    # token_final_scales = torch.ones_like(
+                    #     token_selected_slots, dtype=token_final_scales.dtype)
 
         x_sf = None
         x_row = x.shape[0]
@@ -618,21 +619,21 @@ class WideEPMoE(MoE):
                 assert x.shape[2] == hidden_size // 2 and x_sf.shape[
                     2] == hidden_size // 16
 
-                mask = torch.arange(
-                    x.shape[1], dtype=torch.int32, device=x.device).expand(
-                        x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
-                token_selected_slots = torch.where(
-                    mask,
-                    torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
-                                 x.shape[0] * (self.mapping.moe_ep_rank + 1),
-                                 dtype=torch.int32,
-                                 device=x.device).unsqueeze(1), self.num_slots)
-                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-                x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
-                                    x_sf.shape[2])
-                token_selected_slots = token_selected_slots.view(x.shape[0], 1)
-                token_final_scales = torch.ones_like(
-                    token_selected_slots, dtype=token_final_scales.dtype)
+                # mask = torch.arange(
+                #     x.shape[1], dtype=torch.int32, device=x.device).expand(
+                #         x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
+                # token_selected_slots = torch.where(
+                #     mask,
+                #     torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
+                #                  x.shape[0] * (self.mapping.moe_ep_rank + 1),
+                #                  dtype=torch.int32,
+                #                  device=x.device).unsqueeze(1), self.num_slots)
+                # x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                # x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
+                #                     x_sf.shape[2])
+                # token_selected_slots = token_selected_slots.view(x.shape[0], 1)
+                # token_final_scales = torch.ones_like(
+                #     token_selected_slots, dtype=token_final_scales.dtype)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
@@ -640,8 +641,8 @@ class WideEPMoE(MoE):
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
-            token_selected_slots,
-            token_final_scales,
+            token_selected_slots if recv_expert_count is None else None,
+            token_final_scales if recv_expert_count is None else None,
             w3_w1_weight.view(weight_dtype),
             None,  # w3_w1_bias
             w2_weight.view(weight_dtype),
@@ -663,6 +664,8 @@ class WideEPMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            valid_tokens=recv_expert_count
+            if recv_expert_count is not None else None,
         )
 
         if self.layer_load_balancer and is_last_call:

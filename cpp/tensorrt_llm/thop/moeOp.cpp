@@ -234,10 +234,10 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
-    torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
-        torch::optional<torch::Tensor> const& token_final_scales, torch::Tensor const& fc1_expert_weights,
-        torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
-        torch::optional<torch::Tensor> const& fc2_expert_biases,
+    torch::Tensor runMoe(torch::Tensor const& input, torch::optional<torch::Tensor> const& token_selected_experts,
+        torch::optional<torch::Tensor> const& token_final_scales, torch::optional<torch::Tensor> const& valid_tokens,
+        torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
+        torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
@@ -250,9 +250,18 @@ public:
         freeProfileWorkspace();
 
         TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
+        TORCH_CHECK(token_selected_experts.has_value() != valid_tokens.has_value(),
+            "either token_selected_experts or valid_tokens must be provided");
 
         CHECK_INPUT(input, mActivationDtype)
-        CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
+        if (token_selected_experts.has_value())
+        {
+            CHECK_INPUT(token_selected_experts.value(), at::ScalarType::Int)
+        }
+        else
+        {
+            CHECK_INPUT(valid_tokens.value(), at::ScalarType::Int)
+        }
         if (token_final_scales)
         {
             CHECK_INPUT(token_final_scales.value(), at::ScalarType::Float)
@@ -260,8 +269,16 @@ public:
         CHECK_INPUT(fc1_expert_weights, mWeightDtype)
         CHECK_INPUT(fc2_expert_weights, mWeightDtype)
 
-        TORCH_CHECK(input.dim() == 2, "input must be 2D.");
-        TORCH_CHECK(token_selected_experts.dim() == 2, "token_selected_experts must be 2D.");
+        if (token_selected_experts.has_value())
+        {
+            TORCH_CHECK(input.dim() == 2, "input must be 2D.");
+            TORCH_CHECK(token_selected_experts.value().dim() == 2, "token_selected_experts must be 2D.");
+        }
+        else
+        {
+            TORCH_CHECK(input.dim() == 3, "input must be 3D.");
+            TORCH_CHECK(valid_tokens.value().dim() == 1, "valid_tokens must be 1D.");
+        }
 
         TORCH_CHECK(fc1_expert_weights.dim() == 3, "fc1_expert_weights must be 3D.");
         TORCH_CHECK(fc2_expert_weights.dim() == 3, "fc2_expert_weights must be 3D.");
@@ -298,23 +315,46 @@ public:
                 "fc2_expert_biases should match fc2_expert_weights output shape.");
         }
 
-        TORCH_CHECK(input.sizes()[0] == token_selected_experts.sizes()[0],
-            "input and token_selected_experts must have the same num tokens.");
+        if (token_selected_experts.has_value())
+        {
+            TORCH_CHECK(input.sizes()[0] == token_selected_experts.value().sizes()[0],
+                "input and token_selected_experts must have the same num tokens.");
+        }
+        else
+        {
+            TORCH_CHECK(input.sizes()[0] == valid_tokens.value().sizes()[0],
+                "input and valid_tokens must have the same num experts.");
+        }
         if (token_final_scales)
         {
             TORCH_CHECK(token_final_scales.value().dim() == 2, "token_selected_experts_probs must be 2D.");
-            TORCH_CHECK(input.sizes()[0] == token_final_scales.value().sizes()[0],
-                "input and token_selected_experts_probs must have the same num tokens.");
-            TORCH_CHECK(token_selected_experts.sizes()[1] == token_final_scales.value().sizes()[1],
-                "token_selected_experts and token_final_scales must have the same number of experts per token.");
+            if (token_selected_experts.has_value())
+            {
+                TORCH_CHECK(token_selected_experts.value().sizes()[0] == token_final_scales.value().sizes()[0],
+                    "token_selected_experts and token_final_scales must have the same num tokens.");
+                TORCH_CHECK(token_selected_experts.value().sizes()[1] == token_final_scales.value().sizes()[1],
+                    "token_selected_experts and token_final_scales must have the same number of experts per token.");
+            }
         }
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
         TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
             "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
 
-        int experts_per_token = token_selected_experts.sizes()[1];
-        int64_t num_rows = input.sizes()[0];
+        int experts_per_token;
+        int64_t num_rows, max_tokens_per_expert;
+        if (token_selected_experts.has_value())
+        {
+            experts_per_token = token_selected_experts.value().sizes()[1];
+            num_rows = input.sizes()[0];
+            max_tokens_per_expert = num_rows;
+        }
+        else
+        {
+            experts_per_token = 1;
+            num_rows = input.sizes()[0] * input.sizes()[1];
+            max_tokens_per_expert = input.sizes()[1];
+        }
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
 
@@ -369,11 +409,20 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows, hidden_size};
+        std::vector<int64_t> output_shape;
+        if (token_selected_experts.has_value())
+        {
+            output_shape = {num_rows, hidden_size};
+        }
+        else
+        {
+            output_shape = {input.sizes()[0], input.sizes()[1], hidden_size};
+        }
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode);
+            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode,
+            !valid_tokens.has_value());
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -383,10 +432,13 @@ public:
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
-            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_selected_experts.has_value()
+                ? reinterpret_cast<int const*>(token_selected_experts.value().const_data_ptr())
+                : nullptr,
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
-            fc1_expert_weights.const_data_ptr(),
+            valid_tokens.has_value() ? reinterpret_cast<int const*>(valid_tokens.value().const_data_ptr()) : nullptr,
+            max_tokens_per_expert, fc1_expert_weights.const_data_ptr(),
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
@@ -397,10 +449,13 @@ public:
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
-            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_selected_experts.has_value()
+                ? reinterpret_cast<int const*>(token_selected_experts.value().const_data_ptr())
+                : nullptr,
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
-            fc1_expert_weights.const_data_ptr(),
+            valid_tokens.has_value() ? reinterpret_cast<int const*>(valid_tokens.value().const_data_ptr()) : nullptr,
+            max_tokens_per_expert, fc1_expert_weights.const_data_ptr(),
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
@@ -531,7 +586,8 @@ public:
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
         WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode);
+            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode,
+            /*is_offset_layout=*/true);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
 
@@ -543,7 +599,7 @@ public:
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
-            fc1_expert_weights.const_data_ptr(),
+            /*valid_tokens=*/nullptr, /*max_tokens_per_expert=*/num_rows, fc1_expert_weights.const_data_ptr(),
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
@@ -557,7 +613,7 @@ public:
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
-            fc1_expert_weights.const_data_ptr(),
+            /*valid_tokens=*/nullptr, /*max_tokens_per_expert=*/num_rows, fc1_expert_weights.const_data_ptr(),
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
@@ -722,11 +778,11 @@ private:
 
     WorkspaceInfo getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int num_experts, int experts_per_token, ActivationType activation_type,
-        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode)
+        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode, bool is_offset_layout)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
-            min_latency_mode, mUseW4GroupScaling);
+            min_latency_mode, mUseW4GroupScaling, is_offset_layout);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};

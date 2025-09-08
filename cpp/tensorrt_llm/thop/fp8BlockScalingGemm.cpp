@@ -213,7 +213,8 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
 }
 
 torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset,
+    torch::optional<torch::Tensor> const& valid_tokens)
 {
     TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
     TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
@@ -221,18 +222,32 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     TORCH_CHECK(mat2Scale.scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
     TORCH_CHECK(token_offset.scalar_type() == at::ScalarType::Long, "Token offset dtype must be INT64.");
 
-    TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix of shape (m_total, k)");
-    TORCH_CHECK(mat2.dim() == 3, "mat2 must be a matrix of shape (num_problems, n, k)");
-    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied");
-
-    auto const m_total = mat1.sizes()[0];
+    int64_t max_tokens_per_expert, m_total;
+    std::vector<int64_t> out_shape;
     auto const num_problems = mat2.sizes()[0];
     auto const n = mat2.sizes()[1];
     auto const k = mat2.sizes()[2];
+    TORCH_CHECK(mat2.dim() == 3, "mat2 must be a matrix of shape (num_problems, n, k)");
     TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
     TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+    if (!valid_tokens.has_value())
+    {
+        TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix of shape (m_total, k)");
+        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied");
+        m_total = mat1.sizes()[0];
+        max_tokens_per_expert = m_total;
+        out_shape = {m_total, n};
+    }
+    else
+    {
+        TORCH_CHECK(mat1.dim() == 3, "mat1 must be a matrix of shape (num_problems, max_tokens_per_expert, k)");
+        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied");
+        m_total = mat1.sizes()[0] * mat1.sizes()[1];
+        max_tokens_per_expert = mat1.sizes()[1];
+        out_shape = {num_problems, max_tokens_per_expert, n};
+    }
 
-    at::Tensor out = at::detail::empty_cuda({m_total, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+    at::Tensor out = at::detail::empty_cuda(out_shape, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
 
     auto gemm_runner = get_gemm_runner(mat1.scalar_type(), mat2.scalar_type());
 
@@ -241,23 +256,27 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     float const* mat1ScalePtr = mat1Scale.data_ptr<float>();
     float const* mat2ScalePtr = mat2Scale.data_ptr<float>();
 
-    auto workspace_size = static_cast<int64_t>(gemm_runner->getWorkspaceSizeBase(m_total, n, k, num_problems));
+    auto workspace_size = static_cast<int64_t>(
+        gemm_runner->getWorkspaceSizeBase(m_total, n, k, num_problems, !valid_tokens.has_value()));
     auto workspace = at::detail::empty_cuda({workspace_size}, at::ScalarType::Byte, mat1.device(), std::nullopt);
     void* workspace_ptr = workspace.data_ptr();
     gemm_runner->configureWorkspace(static_cast<char*>(workspace_ptr));
     gemm_runner->moeGemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(),
-        static_cast<int64_t*>(token_offset.data_ptr()), num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
+        static_cast<int64_t*>(token_offset.data_ptr()),
+        valid_tokens.has_value() ? static_cast<int32_t const*>(valid_tokens.value().data_ptr()) : nullptr,
+        max_tokens_per_expert, num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
 
     return out;
 }
 
 extern torch::Tensor fp8_block_scaling_moe_gemm(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset,
+    torch::optional<torch::Tensor> const& valid_tokens)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     switch (sm)
     {
-    case 90: return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset);
+    case 90: return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset, valid_tokens);
     default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling MoEGEMM");
     }
 }
@@ -350,7 +369,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp8_block_scaling_bmm_out(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor(a!) out) -> "
         "Tensor(a!)");
     m.def(
-        "fp8_block_scaling_moe_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor token_offset) "
+        "fp8_block_scaling_moe_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor token_offset, "
+        "Tensor? valid_tokens) "
         "-> Tensor");
 }
 

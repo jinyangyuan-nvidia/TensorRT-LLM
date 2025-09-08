@@ -45,6 +45,11 @@ public:
         float const* scales_b = nullptr)
         = 0;
 
+    virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        int32_t const* valid_tokens, int64_t max_tokens_per_expert, size_t num_problems, size_t shape_n, size_t shape_k,
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr)
+        = 0;
+
     virtual void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a,
         int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n,
         int shape_k, cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b)
@@ -62,8 +67,14 @@ public:
     // Returns desired workspace size in bytes.
     virtual size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1)
         = 0;
+    virtual size_t getWorkspaceSizeBase(
+        size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1, bool is_offset_layout = true)
+        = 0;
     virtual size_t getWorkspaceSize(
         size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1)
+        = 0;
+    virtual size_t getWorkspaceSize(size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1,
+        size_t num_problems = 1, bool is_offset_layout = true)
         = 0;
 
     void configureWorkspace(char* ws_ptr)
@@ -99,6 +110,10 @@ public:
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr) override;
 
+    void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        int32_t const* valid_tokens, int64_t max_tokens_per_expert, size_t num_problems, size_t shape_n, size_t shape_k,
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+
     void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a, int stride_a,
         __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n, int shape_k,
         cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b) override;
@@ -112,8 +127,12 @@ public:
 
     // Returns desired workspace size in bytes.
     size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
+    size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1,
+        bool is_offset_layout = true) override;
     size_t getWorkspaceSize(
         size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1) override;
+    size_t getWorkspaceSize(size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1,
+        bool is_offset_layout = true) override;
 
     size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) override;
     size_t getActScaleSize(int shape_m, int shape_k) override;
