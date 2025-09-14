@@ -465,7 +465,7 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
-                if is_last_call:
+                if self.layer_load_balancer is not None and is_last_call:
                     loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                     )
                 else:
@@ -545,7 +545,7 @@ class WideEPMoE(MoE):
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
                             isSfSwizzledLayout=False)
-                    x_sf = x_sf.view((x_row, -1))
+                    x_sf = x_sf.view((x_row, x_col // 16))
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
